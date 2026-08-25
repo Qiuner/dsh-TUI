@@ -77,7 +77,7 @@ import { readActivityConfig } from '../activityPrefs.js'
 import { attachSessionToWorkspace } from './workspace.js'
 import { createLocalWorkspaceRuntime, getHostWorkspaceRuntime, type TuiWorkspaceCommand, type TuiWorkspaceCommandResult, type TuiWorkspaceTarget } from './workspaces.js'
 import { getHostCommandTrees } from './command-trees.js'
-import { getHostSettingsSections, type TuiSettingsSection, type TuiSettingsSectionsRuntime } from './settings-sections.js'
+import { getHostSettingsSections, getLocalSettingsSectionsHost, type TuiSettingsSection, type TuiSettingsSectionsRuntime } from './settings-sections.js'
 import type { SettingsHost } from './settingsEditor.js'
 import { getHostSceneRuntime, type TuiSceneDescriptor, type TuiSceneRuntime } from './scenes.js'
 import { getHostRenderers, type TuiRendererRuntime } from './renderers.js'
@@ -521,6 +521,10 @@ export interface Channel {
   readonly gitBranch: string | undefined
   /** True between turn/start and turn/end — drives the working spinner. */
   readonly working: boolean
+  /** True while a user-requested abort (Ctrl+C/Esc interrupt) has not yet
+   *  converged — no turn/start or turn/end has retired the aborted turn.
+   *  Chat uses it so a repeated Ctrl+C during a stuck abort force-exits. */
+  readonly cancelPending: boolean
   /** Which phase the spinner should present while working. */
   readonly spinnerMode: SpinnerMode
   /** Chars streamed as text this turn (feeds the spinner token counter). */
@@ -668,7 +672,9 @@ export interface Channel {
   steer(text: string): void
   /** Pull a pending message back out of the inbox (Alt+Up) for re-editing. */
   removePending(id: string): boolean
-  /** Abort the in-flight turn (`Ctrl+C` while working). */
+  /** Abort the in-flight turn (`Ctrl+C` while working). While `cancelPending`
+   *  stays true the abort has not converged; Chat force-exits on the next
+   *  Ctrl+C press in that window. */
   cancel(): void
   /** Abort the in-flight turn and process `texts` right away (Esc/Ctrl+Enter
    *  with queued input): each text is re-queued as a followup once the abort
@@ -920,6 +926,8 @@ export interface ChannelState {
   displayCwd: string
   gitBranch: string | undefined
   working: boolean
+  /** Whether a requested abort is still converging (see the public Channel type). */
+  cancelPending: boolean
   spinnerMode: SpinnerMode
   responseChars: number
   activeToolCount: number
@@ -1647,9 +1655,12 @@ export function createChannel(
   // tuiWorkspaces/tuiCommandTrees): mounted by the bundle patch's
   // dsh-tui-scenes row; absent the row, `pluginScene` simply stays undefined.
   const sceneRuntime = getHostSceneRuntime(ctx.get('tuiScenes') as TuiSceneRuntime | undefined)
+  // Falls back to the in-package local host when the composition's service
+  // row is unavailable (issue #557: the row can be disposed right after
+  // load in real compositions); the TUI's own section registers there.
   const settingsSectionsRuntime = getHostSettingsSections(
     ctx.get('tuiSettingsSections') as TuiSettingsSectionsRuntime | undefined,
-  )
+  ) ?? getLocalSettingsSectionsHost()
   // Custom-entry text renderers (optional service, dsh-tui-extensions row):
   // absent the row, unknown plugin event types stay invisible in the
   // transcript, exactly as before the seam existed.
@@ -1966,6 +1977,7 @@ export function createChannel(
     state.activeToolCount = 0
     state.lastUserText = ''
     state.working = false
+    state.cancelPending = false
     state.spinnerMode = 'requesting'
     state.status = handle.agent.status
     state.agentId = handle.agent.id
@@ -2526,6 +2538,7 @@ export function createChannel(
     displayCwd: workspaceService.describe(options.cwd).description ?? options.cwd,
     gitBranch: undefined,
     working: false,
+    cancelPending: false,
     spinnerMode: 'requesting',
     responseChars: 0,
     activeToolCount: 0,
@@ -2826,9 +2839,11 @@ export function createChannel(
       // Keep the staged queue: an interrupt aborts the running turn but the
       // queued/steered messages are delivered as the next turn (web parity).
       // Cancellation converges asynchronously; ignore a repeated Esc/Ctrl+C
-      // until the aborted turn has produced its terminal event.
+      // until the aborted turn has produced its terminal event. `cancelPending`
+      // mirrors that window for the UI, where a repeated press force-exits.
       if (cancelInFlight) return
       cancelInFlight = true
+      state.cancelPending = true
       agent.cancel({ kind: 'user' }, { keepInbox: true })
     },
     interruptAndDeliver(texts: readonly string[]): number {
@@ -2846,6 +2861,7 @@ export function createChannel(
         cancelInFlight = true
         agent.cancel({ kind: 'user' })
       }
+      state.cancelPending = true
       const token = ++interruptSeq
       const deliver = (): void => {
         // A second interrupt while the abort is still settling must not
@@ -3815,6 +3831,7 @@ export function createChannel(
       state.activeToolCount = 0
       state.lastUserText = ''
       state.working = false
+      state.cancelPending = false
       state.spinnerMode = 'requesting'
       state.status = handle.agent.status
       state.agentId = handle.agent.id
@@ -3994,6 +4011,7 @@ export function createChannel(
       state.activeToolCount = 0
       state.lastUserText = ''
       state.working = false
+      state.cancelPending = false
       state.spinnerMode = 'requesting'
       state.status = handle.agent.status
       state.agentId = handle.agent.id
@@ -4182,6 +4200,7 @@ export function createChannel(
       state.activeToolCount = 0
       state.lastUserText = ''
       state.working = false
+      state.cancelPending = false
       state.spinnerMode = 'requesting'
       state.status = handle.agent.status
       state.agentId = handle.agent.id
@@ -5063,7 +5082,7 @@ export function createChannel(
       }
       // Session store candidates mirror the compat layer (sessionsRoots):
       // the active root depends on the composition (bare cordis.yml →
-      // legacy ~/.dsh-tui, profile → $DSH_HOME/sessions), so list every
+      // legacy ~/.dsh-tui/sessions, profile → $DSH_HOME/sessions), so list every
       // candidate with its own state instead of hardcoding one.
       for (const dir of sessionsRoots()) {
         lines.push(`${t('doctor-storage', { dir, state: existsSync(dir) ? '✓' : t('doctor-storage-uninit') })}`)
@@ -6252,6 +6271,7 @@ ${output}
       }
       case 'turn/start': {
         cancelInFlight = false
+        state.cancelPending = false
         state.working = true
         state.turnStart = Date.now()
         state.responseChars = 0
@@ -6268,6 +6288,7 @@ ${output}
       }
       case 'turn/end': {
         cancelInFlight = false
+        state.cancelPending = false
         settleStreaming()
         state.working = false
         state.activeToolCount = 0
@@ -6305,7 +6326,11 @@ ${output}
           nextRowId += 1
           break
         }
-        const detail = reason.kind === 'error' ? reason.error.message : ''
+        // The notice renders as a single-line Divider title: error.message
+        // can carry newlines/control chars, and an embedded \n splits the
+        // rule across rows. cleanRenderText is the render-path single-line
+        // contract (sessionTree's preview() folds likewise for the tree).
+        const detail = reason.kind === 'error' ? cleanRenderText(reason.error.message, NOTICE_CELLS) : ''
         state.rows.push({ id: nextRowId, kind: 'notice', text: `turn ${reason.kind}${detail ? ` · ${detail}` : ''}` })
         nextRowId += 1
         state.notify(
@@ -6400,6 +6425,7 @@ ${output}
   // Attached to an idle agent: any replayed turn/start belongs to a previous
   // session run, so the spinner must not come up on boot.
   state.working = false
+  state.cancelPending = false
   state.status = agent.status
   state.emit()
 
