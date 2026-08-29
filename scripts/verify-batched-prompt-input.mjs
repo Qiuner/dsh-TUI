@@ -20,11 +20,13 @@ import { settled, sleep, viewportLines } from './lib/term-test.mjs'
 const { Terminal: XTerm } = xtermHeadless
 
 let failed = 0
+/** Print one pass/fail line and keep a running failure count. */
 function check(name, ok, extra = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}${extra ? `  (${extra})` : ''}`)
   if (!ok) failed += 1
 }
 
+/** Build the writable TTY streams used by the headless prompt harness. */
 function makeStreams(term) {
   const stdout = new Writable({
     write(chunk, _encoding, callback) {
