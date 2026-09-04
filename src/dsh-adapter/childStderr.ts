@@ -58,6 +58,12 @@ function redirectInheritedStderr(options: childProcess.SpawnOptions): childProce
   return undefined
 }
 
+/** Cap on the unterminated tail: a child that never emits a newline (progress
+ * bars, single-line JSON streams) must not grow the line buffer without bound
+ * — past the cap the partial line is flushed to the sink (which applies its
+ * own display-length truncation) and the buffer restarts empty. */
+const MAX_PENDING_CHARS = 64 * 1024
+
 /** Drain a piped stderr stream, forwarding complete lines (and the unterminated tail) to the sink. */
 function drainLines(stream: NodeJS.ReadableStream, sink: (line: string) => void): void {
   let pending = ''
@@ -68,6 +74,10 @@ function drainLines(stream: NodeJS.ReadableStream, sink: (line: string) => void)
       sink(pending.slice(0, newline))
       pending = pending.slice(newline + 1)
       newline = pending.indexOf('\n')
+    }
+    if (pending.length > MAX_PENDING_CHARS) {
+      sink(pending)
+      pending = ''
     }
   })
   stream.on('end', () => {
@@ -177,6 +187,15 @@ export function createChildStderrReporter(
         groups.delete(line)
         // A burst inside the cooldown window is counted but stays silent.
         if ((mutedUntil.get(line) ?? 0) > Date.now()) return
+        // Prune expired cooldowns on the way in: entries are child-stderr
+        // lines and a long-lived MCP reconnect loop would otherwise grow the
+        // dedup table without bound.
+        if (mutedUntil.size > 64) {
+          const now = Date.now()
+          for (const [key, until] of mutedUntil) {
+            if (until <= now) mutedUntil.delete(key)
+          }
+        }
         mutedUntil.set(line, Date.now() + cooldownMs)
         const text =
           group.count > 1

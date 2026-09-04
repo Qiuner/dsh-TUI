@@ -128,12 +128,17 @@ assert.match(
 )
 assert.doesNotMatch(plugin, /if \(created\)/, 'startup attachment must not skip resumed legacy sessions')
 assert.equal(
-  [...channel.matchAll(/await attachSessionToWorkspace\(ctx, (?:state\.cwd|handle\.agent\.session\.header\.cwd \?\? state\.cwd), (?:SessionId\(sessionId\)|childId|sessionId)\)/g)].length,
-  4,
-  'rewind, /resume, /new, and model-switch paths all attach ownership',
+  [...channel.matchAll(/await attachSessionToWorkspace\(ctx, (?:state\.cwd|handle\.agent\.session\.header\.cwd \?\? state\.cwd|sourceCwd), (?:SessionId\(sessionId\)|childId|sessionId)\)/g)].length,
+  6,
+  'rewind, /resume, /new, model-switch, tree rewindToNode, and /fork paths all attach ownership',
 )
 for (const id of ['storage', 'storage-json', 'storage-domain', 'workspace']) {
-  assert.match(patch, new RegExp(`- id: ${id}\\n`), `profile patch mounts ${id}`)
+  assert.match(patch, new RegExp(`- id: dsh-tui-${id}\\n`), `profile patch mounts scoped dsh-tui-${id}`)
+  assert.match(
+    patch,
+    new RegExp(`dsh-tui-${id}[\\s\\S]{0,260}entry\\.options\\.id === '${id}'`),
+    `scoped dsh-tui-${id} yields to the official ${id} row`,
+  )
 }
 assert.match(patch, /root: !!js dshHomePath\('storages'\)/)
 assert.match(

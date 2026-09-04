@@ -12,10 +12,11 @@
  *      禁令）与畸形 valueDigest 的记录被丢弃；超长 kind 清洗截断后保留；
  *   E. schema 缺失 fail-closed：全部写入被抑制、文件不创建、warn 恰好一次；
  *   F. 接线端到端：storage open/deny、shortcut register/dispose、status
- *      set/overwrite/dispose 经服务真实落台账且三元组正确；
+ *      set/overwrite/dispose、runtime theme create/release/duplicate 经服务
+ *      真实落台账且三元组正确；
  *   G. 文件零哨兵值：全文无 undefined/NaN，逐行 JSON 可解析且过 schema；
  *   H. 接线断言：plugin-host apply 挂载序（host→ledger→storage→observer）、
- *      公共 shim 导出、四服务 identity 末参签名。
+ *      公共 shim 导出、五服务 identity 末参签名。
  *
  * HOME/USERPROFILE 在导入 src 前隔离。
  *
@@ -37,10 +38,11 @@ const pluginHostRow = await import('../src/dsh-adapter/plugin-host.js')
 const { TuiEffectLedgerRuntime, EFFECT_LEDGER_FILE } = await import('../src/dsh-adapter/effect-ledger.js')
 const { TuiStatusRuntime } = await import('../src/dsh-adapter/status.js')
 const { default: TuiShortcutRuntime } = await import('../src/dsh-adapter/shortcuts.js')
+const { default: TuiThemeRuntime } = await import('../src/dsh-adapter/themes.js')
 const { loadSpecData } = await import('../src/plugin-spec/registry.js')
 const { check: schemaCheck } = await import('../src/plugin-spec/schema-check.js')
 const { DATA_DIR } = await import('../src/utils/paths.js')
-const { mountAdmitted, testManifest, STORAGE_COORDINATE } = await import('./plugin-test-utils.js')
+const { mountAdmitted, testManifest, STORAGE_COORDINATE } = await import('../src/dsh-adapter/plugin-test-utils.js')
 import type { LedgerEntry } from '../src/dsh-adapter/effect-ledger.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -77,9 +79,12 @@ const readRecords = (file: string): FileRecord[] =>
 
 /** 一个已通过官方 parser/admission 的插件上下文。 */
 const namedCtx = async (host: InstanceType<typeof Context>, plugin: string, id = `com.example.${plugin}`,
-  permissions: readonly { name: string; scope: string }[] = []): Promise<InstanceType<typeof Context>> => {
+  permissions: readonly { name: string; scope: string }[] = [],
+  requires: readonly { apiVersion: string; kind: string; optional?: boolean; fallback?: string }[] = [],
+): Promise<InstanceType<typeof Context>> => {
   const admitted = await mountAdmitted(host, plugin, testManifest({
     id,
+    requires,
     permissions,
   }))
   return admitted.context
@@ -217,8 +222,8 @@ const fileA = join(fakeHome, 'ledger-a.jsonl')
   const alpha = await namedCtx(ctx, 'alpha', 'com.example.alpha', [
     { name: 'storage.local.read', scope: 'com.example.alpha' },
     { name: 'storage.local.write', scope: 'com.example.alpha' },
-  ])
-  const gamma = await namedCtx(ctx, 'gamma', 'com.example.gamma')
+  ], [STORAGE_COORDINATE])
+  const gamma = await namedCtx(ctx, 'gamma', 'com.example.gamma', [], [STORAGE_COORDINATE])
 
   const storage = ctx.get('tuiPluginStorage')
   if (storage === undefined) throw new Error('tuiPluginStorage not mounted by the row')
@@ -232,14 +237,28 @@ const fileA = join(fakeHome, 'ledger-a.jsonl')
     checks += 1 // 拒绝成立（PERMISSION_NOT_GRANTED 由 storage 电池覆盖）
   }
 
-  const shortcuts = new TuiShortcutRuntime(ctx)
+  new TuiShortcutRuntime(ctx)
+  const shortcuts = alpha.get('tuiShortcuts') as InstanceType<typeof TuiShortcutRuntime>
   const disposeShortcut = shortcuts.register('ctrl+shift+z', { description: '电池快捷键', handler: () => {} }, alpha)
   disposeShortcut()
 
-  const status = new TuiStatusRuntime(ctx)
+  new TuiStatusRuntime(ctx)
+  const status = alpha.get('tuiStatus') as InstanceType<typeof TuiStatusRuntime>
   const disposeStatus = status.set('alpha-line', 'v1', alpha)
   status.set('alpha-line', 'v2', alpha)
   disposeStatus() // v1 的 disposer 已被 v2 取代 → 不得再落 release
+
+  new TuiThemeRuntime(ctx)
+  const themes = alpha.get('tuiThemes') as InstanceType<typeof TuiThemeRuntime>
+  const disposeTheme = themes.register(
+    { name: 'alpha:theme', base: 'dark', colors: { claude: '#123456' } },
+    alpha,
+  )
+  themes.register(
+    { name: 'alpha:theme', base: 'dark', colors: { claude: '#654321' } },
+    alpha,
+  )
+  disposeTheme()
 
   const records = readRecords(EFFECT_LEDGER_FILE)
   const byKind = (kind: string, id?: string) => records.filter(r => r.resource.kind === kind && (id === undefined || r.resource.id === id))
@@ -263,6 +282,14 @@ const fileA = join(fakeHome, 'ledger-a.jsonl')
   const replace = statusRecords.find(r => r.operation === 'replace')
   check1('status overwrite records replace with replaces.resourceId', replace?.replaces?.resourceId === 'alpha-line')
   check1('stale status disposer records nothing', !statusRecords.some(r => r.operation === 'release'))
+
+  const themeRecords = byKind('theme', 'alpha:theme')
+  check1('runtime theme register records create with the plugin identity',
+    themeRecords.some(r => r.operation === 'create' && r.result === 'applied' && r.pluginId === 'com.example.alpha'))
+  check1('runtime theme duplicate records DUPLICATE_CONTRIBUTION_ID',
+    themeRecords.some(r => r.operation === 'create' && r.result === 'failed' && r.errorCode === 'DUPLICATE_CONTRIBUTION_ID'))
+  check1('runtime theme dispose records release',
+    themeRecords.some(r => r.operation === 'release' && r.result === 'applied' && r.pluginId === 'com.example.alpha'))
 
   const alphaWired = records.filter(r => r.pluginId === 'com.example.alpha')
   check1('wired records share one activationInstance per fiber', new Set(alphaWired.map(r => r.activationInstance)).size === 1)
@@ -298,8 +325,23 @@ const fileA = join(fakeHome, 'ledger-a.jsonl')
     hostIdx !== -1 && ledgerIdx > hostIdx && storageIdx > ledgerIdx && observerIdx > storageIdx)
 
   const shim = readFileSync(join(root, 'src/plugin-host.ts'), 'utf8')
-  check1('public shim exports effect-ledger', shim.includes("export * from './dsh-adapter/effect-ledger.js'"))
-  check1('public shim exports command-errors', shim.includes("export * from './dsh-adapter/command-errors.js'"))
+  check1('public shim exports safe effect-ledger types without host runtime',
+    shim.includes('export type { LedgerEntry, LedgerOperation, LedgerResult, TuiEffectLedgerRuntime }')
+    && !shim.includes("export * from './dsh-adapter/effect-ledger.js'"))
+  check1('public shim exports command error vocabulary without host internals',
+    shim.includes('COMMAND_ERROR_CODES')
+    && !shim.includes("export * from './dsh-adapter/command-errors.js'"))
+  const publicHost = await import('../src/plugin-host.js')
+  const hostOnlyExports = [
+    'getHostAdmission', 'dispatchTuiNotification', 'decisionHandlersOf',
+    'registerDecisionHandler', 'withDecisionRegistration', 'stampCommandOwner',
+    'unstampCommandOwner', 'commandOwner', 'fiberNameOf', 'TuiPluginHostRuntime',
+    'TuiPluginStorageRuntime', 'TuiMessageObserverRuntime', 'TuiEffectLedgerRuntime',
+  ] as const
+  check1('public shim hides loader, ingress, attribution and host runtime exports',
+    hostOnlyExports.every(name => !(name in publicHost)))
+  check1('public shim retains the Cordis row entry points',
+    typeof publicHost.name === 'string' && typeof publicHost.apply === 'function')
 
   const identityParam = (path: string, method: string) => {
     const source = readFileSync(join(root, path), 'utf8')
@@ -313,6 +355,8 @@ const fileA = join(fakeHome, 'ledger-a.jsonl')
     identityParam('src/dsh-adapter/status.ts', "text: string | number | boolean | undefined"))
   check1('tuiRenderers.register takes the optional identity param',
     identityParam('src/dsh-adapter/renderers.ts', 'renderer: TuiEntryRenderer'))
+  check1('tuiThemes.register takes the optional identity param',
+    identityParam('src/dsh-adapter/themes.ts', 'descriptor: TuiThemeDescriptor'))
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────────────

@@ -2,8 +2,12 @@ import React, { type PropsWithChildren, type Ref } from 'react'
 import Box from '../../ink/components/Box.js'
 import type { DOMElement } from '../../ink/dom.js'
 import type { ClickEvent } from '../../ink/events/click-event.js'
+import type { ContextMenuEvent } from '../../ink/events/context-menu-event.js'
+import type { DragEvent } from '../../ink/events/drag-event.js'
 import type { FocusEvent } from '../../ink/events/focus-event.js'
 import type { KeyboardEvent } from '../../ink/events/keyboard-event.js'
+import type { PointerEvent } from '../../ink/events/pointer-event.js'
+import type { WheelEvent } from '../../ink/events/wheel-event.js'
 import type { Color, Styles } from '../../ink/styles.js'
 import { getTheme, type Theme } from '../../theme.js'
 import { useTheme } from './ThemeProvider.js'
@@ -36,14 +40,31 @@ export type Props = BaseStylesWithoutColors &
     tabIndex?: number
     autoFocus?: boolean
     onClick?: (event: ClickEvent) => void
+    onContextMenu?: (event: ContextMenuEvent) => void
+    /**
+     * Drag protocol handlers, transparently forwarded to the inner Box.
+     * Only inside `<AlternateScreen>`, left button, no modifier at press;
+     * `dragstart` fires on FIRST movement (not press); a press+release
+     * without movement still triggers `onClick`. See Box's JSDoc.
+     */
+    onDragStart?: (event: DragEvent) => void
+    /** Fired on each pointer motion after dragstart. See onDragStart. */
+    onDragMove?: (event: DragEvent) => void
+    /** Fired on release after dragstart. See onDragStart. */
+    onDragEnd?: (event: DragEvent) => void
     onFocus?: (event: FocusEvent) => void
     onFocusCapture?: (event: FocusEvent) => void
     onBlur?: (event: FocusEvent) => void
     onBlurCapture?: (event: FocusEvent) => void
     onKeyDown?: (event: KeyboardEvent) => void
     onKeyDownCapture?: (event: KeyboardEvent) => void
-    onMouseEnter?: () => void
-    onMouseLeave?: () => void
+    onMouseEnter?: (event: PointerEvent) => void
+    onMouseLeave?: (event: PointerEvent) => void
+    /**
+     * Wheel events over this Box's rendered rect (position-routed; see the
+     * ink Box's onWheel JSDoc). Transparently forwarded.
+     */
+    onWheel?: (event: WheelEvent) => void
   }
 
 /** Resolves a color value that may be a theme key to a raw Color. */
@@ -60,7 +81,10 @@ function resolveColor(
   ) {
     return color as Color
   }
-  return theme[color as keyof Theme] as Color
+  // Theme keys may be '' ("no color" in that theme) - collapse to undefined
+  // so empty tokens render as no background/foreground instead of feeding
+  // an empty color string to Ink.
+  return (theme[color as keyof Theme] as Color) || undefined
 }
 
 /**

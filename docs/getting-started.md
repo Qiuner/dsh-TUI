@@ -141,12 +141,25 @@ dsh-tui.cmd --resume
 项目迭代很快，更新复用安装命令，显式指定 `@latest`：
 
 ```sh
+# 更新 Profile runtime（TUI 内 /update 做的就是这件事）
 dsh plugin --profile dsh-tui add @deepseek-harness-tui/dsh-tui@latest
+```
+
+如果你通过全局 `dsh-tui` 命令启动，还需要让 Launcher 对齐（TUI 内的
+`/update` 只更新 profile，不会动全局安装）：
+
+```sh
+npm install -g @deepseek-harness-tui/dsh-tui@latest
+# 或（原本用 pnpm 全局安装时）
+pnpm add -g @deepseek-harness-tui/dsh-tui@latest
 ```
 
 - 不带 `@latest` 时 pnpm 会按 profile `package.json` 里已记录的版本范围
   （如 `^0.1.4`）就地解析，可能停留在旧的主线上——这是"重复执行安装命令
   但版本没变"的常见原因。
+- 修复"版本不一致"时，优先使用启动器打印的"精确版本"命令（例如
+  `npm install -g @deepseek-harness-tui/dsh-tui@0.8.3`）；日常主动升级才
+  使用 `@latest`。
 - 确认生效：启动横幅右上角显示当前版本（`✦ dsh-TUI vX.Y.Z`）。
 - 用户覆盖层 `cordis.patch.yml` 在更新中原样保留；会话数据的存放位置
   可能随版本变化（如 0.3.7 起 `/resume` 改用与 dsh web 共享的 JSONL
@@ -169,15 +182,24 @@ $DSH_HOME/profiles/dsh-tui/cordis.patch.yml
 ## 从源码开发
 
 ```sh
-git clone https://github.com/ccch1mneyyy/dsh-TUI.git
+git clone --recurse-submodules https://github.com/ccch1mneyyy/dsh-TUI.git
 cd dsh-TUI
 pnpm install --frozen-lockfile
 pnpm build
 pnpm smoke
 ```
 
+本仓库有三个子模块，其中 `vendor/dsh-std` 与 `dsh-auth` 是安装必需
+（`pnpm-workspace.yaml` 把 `vendor/dsh-std/packages/*` 列为 workspace 包，
+`dsh-auth` 经 `link:` 引入）。漏掉 `--recurse-submodules` 会让这两个目录为空，
+`pnpm install --frozen-lockfile` 直接失败。已经克隆过的检出补一条：
+
+```sh
+git submodule update --init --recursive
+```
+
 `pnpm build` 会清理忽略入库的 `lib/`，把 `src/` 编译到 `lib/types/`，再运行
-构建门禁。npm Git URL 安装通过 `prepare` 生成同一套运行时；发布 workflow
+构建门禁。**Git URL 安装不受支持**（workspace 依赖/子模块/pnpm ≥11 prepare 白名单三重阻断）；发布 workflow
 也会在打包前显式执行干净编译和包面验证。
 
 真实测试当前源码时，首次使用或正式模型/密钥配置变化后运行：
@@ -221,9 +243,25 @@ node --import tsx/esm scripts/repro-toolcards.tsx
 
 ## 常见问题
 
+### Git URL 安装报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` / `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND`
+
+Git URL（如 `https://github.com/ccch1mneyyy/dsh-TUI`）安装不受支持，三重阻断：
+源 manifest 的 `@dsh-std/*` 是 workspace 依赖（git tarball 原样保留，profile
+内无法解析）；`vendor/dsh-std` 是 git 子模块（依赖抓取不带子模块内容，编译必
+败）；pnpm ≥11 默认拒绝 git 依赖执行 `prepare` 构建脚本。请安装 registry 包：
+
+```sh
+dsh plugin --profile dsh-tui add @deepseek-harness-tui/dsh-tui
+```
+
 ### `dsh-tui requires an interactive terminal`
 
 stdout 不是 TTY。请直接在终端中启动，不要把主进程输出管道到文件或其他命令。
+
+如果 dsh-tui 只是装在某个 profile 里、而实际由 Web / Tauri / GUI 等非终端宿主
+启动 DSH，dsh-tui 会检测到 stdout 不是 TTY 且并非由 `dsh-tui` launcher 启动，
+自动跳过 TUI 前端（不报错、不影响宿主启动）；只有显式执行 `dsh-tui`（含
+standalone 便携版）却没有 TTY 时才会报上面的错误。
 
 ### 找不到 `dsh` 或 `pnpm`
 

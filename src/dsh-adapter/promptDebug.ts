@@ -13,6 +13,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { isAgentLoopRequest, type GenerateOptions } from '@deepseek-ai/dsh-llm'
+import { t } from '../i18n.js'
 
 export const PROMPT_DEBUG_FILENAME = '.dsh-prompt-debug.json'
 
@@ -98,11 +99,19 @@ function captureRequest(
 }
 
 /**
- * Register `/debug-prompt` and retain every final request observed for each
- * live session. The command writes one private, atomic snapshot into the
- * receiving session's workspace; it never records credentials, transport
- * headers, or AbortSignals.
+ * Register `/debug-prompt` and retain the final requests observed for each
+ * live session (most recent {@link DEBUG_PROMPT_MAX_REQUESTS} kept). The
+ * command writes one private, atomic snapshot into the receiving session's
+ * workspace; it never records credentials, transport headers, or
+ * AbortSignals.
  */
+
+/** Retention cap per session: every capture holds the fully assembled
+ * request context (messages + tools), so an unbounded list grows
+ * quadratically with an uncompacted conversation — the dominant long-session
+ * memory term. Retries of the current step stay well inside this window. */
+const DEBUG_PROMPT_MAX_REQUESTS = 8
+
 export function registerPromptDebug(ctx: Context): void {
   const commands = ctx.get('commands') as CommandRuntime | undefined
   const agents = ctx.get('agents') as AgentRegistryLike | undefined
@@ -126,6 +135,9 @@ export function registerPromptDebug(ctx: Context): void {
       request.turn === position.turn && request.step === position.step)
     const attempt = (previous?.attempt ?? 0) + 1
     capture.requests.push(captureRequest(agent, options, capture.requests.length + 1, position, attempt))
+    if (capture.requests.length > DEBUG_PROMPT_MAX_REQUESTS) {
+      capture.requests.splice(0, capture.requests.length - DEBUG_PROMPT_MAX_REQUESTS)
+    }
     return next()
   })
 
@@ -191,7 +203,9 @@ export function registerPromptDebug(ctx: Context): void {
 
       return {
         kind: 'success',
-        text: `Wrote ${capture.requests.length} final LLM request${capture.requests.length === 1 ? '' : 's'} to ${output}. The file contains sensitive conversation and prompt data.`,
+        // Localized copy carries the synced/shared-workspace cleanup reminder
+        // (the snapshot lands in the workspace root, 0600); see i18n.ts.
+        text: t('prompt-debug-saved', { count: capture.requests.length, file: output }),
       }
     },
   }))
