@@ -775,7 +775,12 @@ export function parseMultipleKeypresses(
         const mouse = parseMouseEvent(resynthesized)
         keys.push(mouse ?? parseKeypress(resynthesized))
       } else {
-        keys.push(parseKeypress(token.value))
+        const response = parseTerminalResponse('\x1b' + token.value)
+        if (response) {
+          keys.push({ kind: 'response', sequence: '\x1b' + token.value, response })
+        } else {
+          keys.push(parseKeypress(token.value))
+        }
       }
     }
   }
