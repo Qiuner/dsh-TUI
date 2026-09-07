@@ -45,7 +45,7 @@ const { TuiStatusRuntime } = await import('../src/dsh-adapter/status.js')
 const { default: TuiShortcutRuntime } = await import('../src/dsh-adapter/shortcuts.js')
 const { TuiSceneRuntime } = await import('../src/dsh-adapter/scenes.js')
 const { TuiRendererRuntime } = await import('../src/dsh-adapter/renderers.js')
-const { mountAdmitted, testManifest, COMMAND_COORDINATE } = await import('./plugin-test-utils.js')
+const { mountAdmitted, testManifest, COMMAND_COORDINATE } = await import('../src/dsh-adapter/plugin-test-utils.js')
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
@@ -262,14 +262,26 @@ const check1 = (name: string, ok: boolean, detail?: string) => {
   // one particular expression layout: the channel intentionally stores the
   // definition before resolving its owner so the same value is passed to
   // `execute`'s agent-scoped lookup checks.
-  const definitionLookup = channel.indexOf('const definition = commandService.find(agent, name)')
+  const definitionLookup = channel.indexOf('const definition = commandService.find(commandAgent, name)')
   const ownerLookup = channel.indexOf('const owner = commandOwner(ctx, definition)', definitionLookup)
+  const imagePreparation = channel.indexOf('const batch = await registryCommandImages(', definitionLookup)
+  const rootGrantCheckpoint = channel.indexOf("if (!currentGrantStore().allows(", imagePreparation)
   const checkpoint = definitionLookup
   check1('owner-scoped invoke checkpoint present in channel.ts', checkpoint !== -1)
   check1('owner lookup uses the effective definition', ownerLookup > definitionLookup)
-  const executeAfter = channel.indexOf('commandService.execute(', checkpoint)
+  // The invocation is version-gated (rc.8 composer images vs the legacy
+  // 3-arg call), so match the `commandService.execute` identifier rather
+  // than one particular call shape — the ordering guarantee under test is
+  // that the owner checkpoint precedes the invocation.
+  const executeAfter = channel.indexOf('commandService.execute', checkpoint)
   check1('owner checkpoint runs BEFORE commandService.execute', executeAfter > checkpoint)
-  check1("owner deny path returns t('command-invoke-denied-owner')", channel.includes("return t('command-invoke-denied-owner'"))
+  check1('image preparation runs before the live grant checkpoint',
+    imagePreparation > definitionLookup && rootGrantCheckpoint > imagePreparation)
+  check1('the live grant checkpoint immediately precedes command execution',
+    executeAfter > rootGrantCheckpoint)
+  check1('owner deny keeps the structured draft-preserving error outcome',
+    channel.includes("text: t('command-invoke-denied-owner'")
+      && channel.includes('consumeDraft: false'))
   check1('owner invoke deny records a scoped permission id', channel.includes('resource: { kind: \'permission\', id: `${owner.componentId}:commands.invoke:${owner.commandId}` }'))
   check1('skill register catch maps through mapCommandError', /catch \(error\) \{[\s\S]{0,400}mapCommandError\(error\)/.test(channel))
   check1("skill success recorded as command create applied",
@@ -283,12 +295,30 @@ const check1 = (name: string, ok: boolean, detail?: string) => {
   const ownerCheckpoint = checkpoint
   check1('per-owner checkpoint present', ownerCheckpoint !== -1)
   check1('per-owner checkpoint runs BEFORE commandService.execute',
-    channel.indexOf('commandService.execute(', ownerCheckpoint) > ownerCheckpoint)
+    channel.indexOf('commandService.execute', ownerCheckpoint) > ownerCheckpoint)
+  check1('composer-images invocation is version-gated (0.1.0-rc.8 threshold + 4-param shape present)',
+    channel.includes('commandServiceSupportsImages(')
+    && channel.includes("installedMeetsVersion('@deepseek-ai/dsh-commands', '0.1.0-rc.8')")
+    && channel.includes('CommandExecuteWithImages'))
+  check1('command discovery mirrors the upstream input.images admission flag',
+    channel.includes('acceptsImages: descriptor.input?.images === true'))
+  check1('registry adapter forwards supplied images for upstream admission',
+    !channel.includes('if (!declaresImages) return { images: [], dropped: [] }'))
+  check1('public scene command API keeps the legacy text result',
+    /runExternalCommand\([\s\S]{0,180}\): Promise<string \| undefined>/.test(channel))
+  check1('draft-aware command outcome is additive',
+    channel.includes('runExternalCommandOutcome(')
+      && channel.includes('Promise<ExternalCommandOutcome | undefined>'))
+  check1('public scene image staging keeps the legacy token result',
+    channel.includes('stageImage(input: StagedImageInput): Promise<string>'))
+  check1('opaque composer image staging is additive',
+    channel.includes('stageComposerImage(input: StagedImageInput, generation: number): Promise<StagedImageHandle>'))
   const pluginHost = readFileSync(join(root, 'src/dsh-adapter/plugin-host.ts'), 'utf8')
   check1('the plugin-host row exposes the mediated registerCommand',
     pluginHost.includes('registerCommand(pluginCtx: Context'))
-  check1('registerCommand stamps the resolved definition on success', pluginHost.includes('stampCommandOwner(this.ctx, attributedDefinition, identity, contributionId)'))
-  check1('registerCommand resolves commands through the plugin context', pluginHost.includes("pluginCtx.get('commands')"))
+  check1('registerCommand stamps the resolved definition on success',
+    pluginHost.includes('stampCommandOwner(host, attributedDefinition, identity, contributionId)'))
+  check1('registerCommand resolves commands through the canonical activation context', pluginHost.includes("caller.get('commands')"))
   check1('registerCommand maps duplicate errors', pluginHost.includes('mapCommandError(error)'))
 
   const i18n = readFileSync(join(root, 'src/i18n.ts'), 'utf8')
@@ -302,30 +332,40 @@ const check1 = (name: string, ok: boolean, detail?: string) => {
   const ownerEntry = i18n.slice(ownerIdx, ownerIdx + 500)
   check1('owner deny zh translation names the owner', ownerEntry.includes('{{owner}}'))
   check1('owner deny en translation present', /en:\s*'[^']*owner plugin[^']*'/.test(ownerEntry))
+  const imageAdmissionIdx = i18n.indexOf("'command-images-unsupported'")
+  check1("i18n key 'command-images-unsupported' exists", imageAdmissionIdx !== -1)
 }
 
 // ── H. 非破坏签名（不传 identity 照旧可用）──────────────────────────────────
 {
   const ctx = new Context()
-  const shortcuts = new TuiShortcutRuntime(ctx)
-  const disposeShortcut = shortcuts.register('ctrl+shift+q', { description: '无 identity', handler: () => {} })
-  check1('tuiShortcuts.register without identity returns a disposer', typeof disposeShortcut === 'function')
-  disposeShortcut()
+  new TuiShortcutRuntime(ctx)
+  new TuiSceneRuntime(ctx)
+  new TuiStatusRuntime(ctx)
+  new TuiRendererRuntime(ctx)
+  let activation: import('@deepseek-ai/cordis').Context | undefined
+  const fiber = ctx.inject(['tuiShortcuts', 'tuiScenes', 'tuiStatus', 'tuiRenderers'], (pluginCtx) => {
+    activation = pluginCtx
+    const disposeShortcut = pluginCtx.tuiShortcuts.register('ctrl+shift+q', { description: '无 identity', handler: () => {} })
+    check1('tuiShortcuts.register without identity returns a disposer', typeof disposeShortcut === 'function')
+    disposeShortcut()
 
-  const scenes = new TuiSceneRuntime(ctx)
-  const disposeScene = scenes.register({ id: 'demo-scene', component: () => null })
-  check1('tuiScenes.register without identity returns a disposer', typeof disposeScene === 'function')
-  disposeScene()
+    const disposeScene = pluginCtx.tuiScenes.register({ id: 'demo-scene', component: () => null })
+    check1('tuiScenes.register without identity returns a disposer', typeof disposeScene === 'function')
+    disposeScene()
 
-  const status = new TuiStatusRuntime(ctx)
-  const disposeStatus = status.set('demo-key', 'text')
-  check1('tuiStatus.set without identity returns a disposer', typeof disposeStatus === 'function')
-  disposeStatus()
+    const disposeStatus = pluginCtx.tuiStatus.set('demo-key', 'text')
+    check1('tuiStatus.set without identity returns a disposer', typeof disposeStatus === 'function')
+    disposeStatus()
 
-  const renderers = new TuiRendererRuntime(ctx)
-  const disposeRenderer = renderers.register('demo-plugin/note', () => undefined)
-  check1('tuiRenderers.register without identity returns a disposer', typeof disposeRenderer === 'function')
-  disposeRenderer()
+    const disposeRenderer = pluginCtx.tuiRenderers.register('demo-plugin/note', () => undefined)
+    check1('tuiRenderers.register without identity returns a disposer', typeof disposeRenderer === 'function')
+    disposeRenderer()
+  })
+  await fiber
+  if (activation === undefined) throw new Error('non-breaking signature probe did not activate')
+  await fiber.dispose()
+  await ctx.fiber.dispose()
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────────────

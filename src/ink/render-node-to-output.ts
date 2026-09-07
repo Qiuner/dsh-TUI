@@ -1,8 +1,10 @@
 import indentString from 'indent-string'
 import { applyTextStyles } from './colorize.js'
 import type { DOMElement } from './dom.js'
+import { GEOMETRY_TRACE_ENABLED, noteScrollGeometry } from './geometry-trace.js'
 import getMaxWidth from './get-max-width.js'
 import type { Rectangle } from './layout/geometry.js'
+import type { CachedLayout } from './node-cache.js'
 import { LayoutDisplay, LayoutEdge, type LayoutNode } from './layout/node.js'
 import { nodeCache, pendingClears } from './node-cache.js'
 import type Output from './output.js'
@@ -14,6 +16,7 @@ import {
 } from './squash-text-nodes.js'
 import type { Color } from './styles.js'
 import { isXtermJs } from './terminal.js'
+import { terminalImageSourceFromAttributes } from './terminal-image.js'
 import { widestLine } from './widest-line.js'
 import wrapText from './wrap-text.js'
 
@@ -66,14 +69,91 @@ let scrollHint: ScrollHint | null = null
 // three paths — full-render nodeCache.set, node-level blit early-return,
 // blitEscapingAbsoluteDescendants — so clean-overlay consecutive scrolls
 // still have the rect.
-let absoluteRectsPrev: Rectangle[] = []
-let absoluteRectsCur: Rectangle[] = []
+let absoluteRectsPrev: CachedLayout[] = []
+let absoluteRectsCur: CachedLayout[] = []
+
+// position:absolute nodes of the CURRENT frame with their paint rects, for
+// pointer hit-testing. hitTest's containment recursion cannot reach an
+// absolute child that paints OUTSIDE its parent's rect (OverlayAbove uses
+// bottom:'100%' to float pickers over the transcript — the click point is
+// inside the overlay but outside every ancestor's rect, so the subtree is
+// skipped and the overlay's handlers are unreachable). Dispatchers consult
+// this list first, in reverse paint order (later = visually on top).
+export type AbsoluteHitEntry = { node: DOMElement; rect: Rectangle }
+let absoluteHitList: AbsoluteHitEntry[] = []
+
+/**
+ * The current frame's absolute-positioned nodes in paint order.
+ * @returns read-only list; reverse-iterate for topmost-first hit-testing.
+ */
+export function getAbsoluteHitList(): readonly AbsoluteHitEntry[] {
+  return absoluteHitList
+}
 
 /** Reset the scroll hint for the next frame and rotate the absolute-rect buffers. */
 export function resetScrollHint(): void {
   scrollHint = null
   absoluteRectsPrev = absoluteRectsCur
   absoluteRectsCur = []
+  absoluteHitList = []
+}
+
+/** A node fills every cell of its rect when it has its own background or
+ *  is declared `opaque`; anything else leaves gaps to the layer below. */
+function paintsOwnRect(node: DOMElement): boolean {
+  return node.style.opaque === true || node.style.backgroundColor !== undefined
+}
+
+function sameRect(a: CachedLayout, b: CachedLayout): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
+}
+
+/**
+ * Frame-end check: did any PREVIOUS frame's absolute overlay vacate cells
+ * that no CURRENT overlay rect covers (the overlay shrank or moved)?
+ *
+ * Opaque/filled absolute overlays (OverlayAbove pickers above the input,
+ * tooltips) paint over non-sibling subtrees (e.g. the transcript ScrollBox,
+ * which rendered EARLIER in tree order). When such a rect shrinks, the cells
+ * it vacated exist in prevScreen only as the overlay's own pixels; the
+ * underlying subtree is clean, so its blit would restore those stale pixels
+ * and the diff never clears them (real-machine report: the slash menu keeps
+ * its old rows after a filter narrows it, until any unrelated repaint).
+ * DOM removal covers the CLOSE case (consumeAbsoluteRemovedFlag); this check
+ * covers shrink/move: the caller poisons the NEXT frame (renders without
+ * prevScreen) so the vacated cells are re-derived from the real tree.
+ * Growth is fine — a current rect that fully contains the previous rect
+ * repaints the whole area itself this frame — but only when that current
+ * node is opaque (own background or `opaque`). A transparent absolute node
+ * (a click-catcher spanning the transcript) paints nothing of its own, so
+ * it cannot stand in for the cells an opaque sibling card vacated when it
+ * shrank: the clean subtree underneath would blit the old card's pixels
+ * back from prevScreen (real-machine report: switching the image preview to
+ * a smaller image left the wider card's borders and title on screen).
+ */
+export function hasOverlayVacatedCells(): boolean {
+  if (absoluteRectsPrev.length === 0) return false
+  outer: for (const prev of absoluteRectsPrev) {
+    if (prev.width <= 0 || prev.height <= 0) continue
+    for (const cur of absoluteRectsCur) {
+      // A node that kept its exact rect vacated nothing, opaque or not.
+      // Without this the transparent click-catcher spanning the transcript
+      // was never "covered" and poisoned every frame while a preview was
+      // open (full re-render instead of the blit fast path).
+      if (cur.opaque !== true && !sameRect(cur, prev)) continue
+      if (
+        cur.x <= prev.x &&
+        cur.y <= prev.y &&
+        cur.x + cur.width >= prev.x + prev.width &&
+        cur.y + cur.height >= prev.y + prev.height
+      ) {
+        // A current overlay still covers this previous rect completely.
+        continue outer
+      }
+    }
+    return true
+  }
+  return false
 }
 
 /**
@@ -112,6 +192,12 @@ export function getScrollDrainNode(): DOMElement | null {
 // scrolls, eventually clipping at the top). The frontFrame screen buffer
 // still holds the old content at that point — captureScrolledRows reads
 // from it before the front/back swap to preserve the text for copy.
+// Wheel drains report here too (issue #438): the pendingScrollDelta drain
+// below records its SIGNED per-frame delta (negative = content moved
+// down, wheel-up) so the selection follows wheel scrolls as well. One
+// event per ScrollBox per frame; when several boxes scroll in the same
+// frame, ink.tsx attributes the selection to the innermost viewport
+// containing it (see pickFollowForSelection).
 /**
  * At-bottom follow scroll recorded this frame: the scroll delta and
  * viewport bounds, consumed by ink.tsx to translate the active text
@@ -121,16 +207,85 @@ export type FollowScroll = {
   delta: number
   viewportTop: number
   viewportBottom: number
+  /** Current viewport rows map to PREVIOUS screen rows by this offset. */
+  screenRowOffset?: number
 }
-let followScroll: FollowScroll | null = null
+let followScrolls: FollowScroll[] = []
 
 /**
- * Read and clear the follow-scroll event recorded this frame.
- * @returns the follow-scroll delta and viewport bounds, or null.
+ * A ScrollBox viewport-edges change with NO content scroll: chrome mounting
+ * or unmounting around the box (the new-messages pill, the sticky prompt
+ * header, the working spinner, prompt multi-line growth) moves the edges
+ * while scrollTop stands still, so no FollowScroll fires. `delta` is
+ * therefore always 0 — the type extends FollowScroll only so
+ * pickFollowForSelection can attribute the change by the PREVIOUS bounds
+ * (viewportTop/viewportBottom carry the old edges, exactly what
+ * anchor-containment needs). Equal movement of both edges is a viewport
+ * translation, not an edge resize: its rowDelta must move the selection
+ * without capturing or popping scroll debt. ink.tsx consumes these alongside
+ * followScrolls and dispatches the two geometries separately.
  */
-export function consumeFollowScroll(): FollowScroll | null {
-  const f = followScroll
-  followScroll = null
+export type ViewportResize = FollowScroll & {
+  /** Geometry kind: chrome edge change or a same-height viewport move. */
+  kind: 'edge-resize' | 'translate'
+  /** Screen-row movement for a `translate`; 0 for an edge resize. */
+  rowDelta: number
+  /** Viewport bounds BEFORE this frame's layout (= the frontFrame's). */
+  prevTop: number
+  prevBottom: number
+  /** Viewport bounds AFTER this frame's layout. */
+  top: number
+  bottom: number
+}
+let viewportResizes: ViewportResize[] = []
+
+/**
+ * Classify a viewport edge change without consulting scroll state. A valid
+ * same-height range whose two edges move by the same non-zero amount is a
+ * screen-space translation; every other change is an edge resize. Invalid
+ * ranges deliberately stay on the resize path so its collapse guards can
+ * clear or preserve selection safely.
+ * @param prevTop - previous viewport top row.
+ * @param prevBottom - previous viewport bottom row.
+ * @param top - current viewport top row.
+ * @param bottom - current viewport bottom row.
+ * @returns the geometry kind for the viewport event.
+ */
+export function classifyViewportChange(
+  prevTop: number,
+  prevBottom: number,
+  top: number,
+  bottom: number,
+): 'edge-resize' | 'translate' {
+  const valid = (lo: number, hi: number): boolean =>
+    Number.isFinite(lo) && Number.isFinite(hi) && lo <= hi
+  if (!valid(prevTop, prevBottom) || !valid(top, bottom)) return 'edge-resize'
+  const topDelta = top - prevTop
+  const bottomDelta = bottom - prevBottom
+  return topDelta !== 0 && topDelta === bottomDelta ? 'translate' : 'edge-resize'
+}
+
+/**
+ * Read and clear this frame's viewport-resize events. At most one per
+ * ScrollBox per frame; empty unless some box's edges moved.
+ * @returns this frame's viewport-resize events; empty when none.
+ */
+export function consumeViewportResizes(): ViewportResize[] {
+  const v = viewportResizes
+  viewportResizes = []
+  return v
+}
+
+/**
+ * Read and clear the follow-scroll events recorded this frame. At most one
+ * per ScrollBox (a box that follows AND drains reports only the follow —
+ * the follow branch clears pendingScrollDelta before the drain runs);
+ * several boxes may each report when they scroll in the same frame.
+ * @returns this frame's follow-scroll events; empty when none.
+ */
+export function consumeFollowScroll(): FollowScroll[] {
+  const f = followScrolls
+  followScrolls = []
   return f
 }
 
@@ -485,47 +640,93 @@ function renderNodeToOutput(
     let y = offsetY + yogaTop
     const width = yogaNode.getComputedWidth()
     const height = yogaNode.getComputedHeight()
+    const imageSource =
+      node.nodeName === 'ink-image'
+        ? terminalImageSourceFromAttributes(node.attributes)
+        : undefined
+    const imageAdmitted =
+      imageSource === undefined
+        ? false
+        : output.image(node, x, y, width, height, imageSource, node.style.backgroundColor ?? inheritedBackgroundColor)
 
-    // Absolute-positioned overlays (e.g. autocomplete menus with bottom='100%')
-    // can compute negative screen y when they extend above the viewport. Without
-    // clamping, setCellAt drops cells at y<0, clipping the TOP of the content
-    // (best matches in an autocomplete). By clamping to 0, we shift the element
-    // down so the top rows are visible and the bottom overflows below — the
-    // opaque prop ensures it paints over whatever is underneath.
-    if (y < 0 && node.style.position === 'absolute') {
-      y = 0
-    }
+    // Absolute-positioned overlays anchored above their parent
+    // (bottom='100%') compute negative screen y when their content is
+    // taller than the space above the anchor. Do NOT clamp y to 0 here:
+    // shifting the node down breaks the bottom-anchoring contract — the
+    // panel's BOTTOM would overflow past the anchor and paint over the
+    // composer/status rows below it (small-terminal overlay reports).
+    // Instead let the y<0 rows clip naturally: setCellAt drops cells above
+    // row 0 and blitRegion clamps in screen space, so the panel keeps its
+    // bottom pinned at the anchor and only loses its topmost rows — the
+    // same semantics as CSS clipping above the containing block. Producers
+    // prevent the case entirely by maxHeight-ing the overlay to the actual
+    // space above the anchor (OverlayAbove), so clipping is the last
+    // resort, not the layout.
 
     // Check if we can skip this subtree (clean node with unchanged layout).
     // Blit cells from previous screen instead of re-rendering.
     const cached = nodeCache.get(node)
+    // The node's EFFECTIVE background = its own + the inherited one. When it
+    // changed since the last frame (hover on/off toggles a row's
+    // backgroundColor, a parent's bg swap changes every child's inherited
+    // value), prevScreen still holds the OLD background — a clean child
+    // blitting it would resurrect the stale color (stuck hover highlights:
+    // the row's fill is skipped once the bg is removed, its clean children
+    // then blit the previous bg'd cells, the frame equals prevScreen, the
+    // diff finds nothing, and the highlight never clears). Compare against
+    // the value recorded at the previous render and refuse the blit when it
+    // moved.
+    const effectiveBg = node.style.backgroundColor ?? inheritedBackgroundColor
+    const bgChanged = cached?.bg !== effectiveBg
+    const imageBackingChanged =
+      node.nodeName === 'ink-image' &&
+      output.terminalImagesEnabled &&
+      imageAdmitted !== output.hadPreviousImage(node)
     if (
       !node.dirty &&
       !skipSelfBlit &&
+      // A backdrop node re-emits its shade every frame: the cells beneath it
+      // may have been rewritten by an earlier sibling (streaming text), and
+      // only a shade placed at this node's point in the paint order dims
+      // them without touching the card painted after it.
+      node.style.backdrop === undefined &&
       node.pendingScrollDelta === undefined &&
       cached &&
       cached.x === x &&
       cached.y === y &&
       cached.width === width &&
       cached.height === height &&
+      !bgChanged &&
+      !imageBackingChanged &&
       prevScreen
     ) {
       const fx = Math.floor(x)
       const fy = Math.floor(y)
       const fw = Math.floor(width)
       const fh = Math.floor(height)
-      output.blit(prevScreen, fx, fy, fw, fh)
-      if (node.style.position === 'absolute') {
-        absoluteRectsCur.push(cached)
+      if (output.reuseImages(node)) {
+        output.blit(prevScreen, fx, fy, fw, fh)
+        if (node.style.position === 'absolute') {
+          absoluteRectsCur.push(cached)
+          absoluteHitList.push({ node, rect: cached })
+        }
+        // Absolute descendants can paint outside this node's layout bounds
+        // (e.g. a slash menu with position='absolute' bottom='100%' floats
+        // above). If a dirty clipped sibling re-rendered and overwrote those
+        // cells, the blit above only restored this node's own rect — the
+        // absolute descendants' cells are lost. Re-blit them from prevScreen
+        // so the overlays survive.
+        blitEscapingAbsoluteDescendants(
+          node,
+          output,
+          prevScreen,
+          fx,
+          fy,
+          fw,
+          fh,
+        )
+        return
       }
-      // Absolute descendants can paint outside this node's layout bounds
-      // (e.g. a slash menu with position='absolute' bottom='100%' floats
-      // above). If a dirty clipped sibling re-rendered and overwrote those
-      // cells, the blit above only restored this node's own rect — the
-      // absolute descendants' cells are lost. Re-blit them from prevScreen
-      // so the overlays survive.
-      blitEscapingAbsoluteDescendants(node, output, prevScreen, fx, fy, fw, fh)
-      return
     }
 
     // Clear stale content from the old position when re-rendering.
@@ -580,7 +781,7 @@ function renderNodeToOutput(
     // y+1, not y). HelpV2's third shortcuts column hits this — skipping
     // unconditionally drops "ctrl + z to suspend" from /help output.
     if (height === 0 && siblingSharesY(node, yogaNode)) {
-      nodeCache.set(node, { x, y, width, height, top: yogaTop })
+      nodeCache.set(node, { x, y, width, height, top: yogaTop, opaque: paintsOwnRect(node) })
       node.dirty = false
       return
     }
@@ -672,7 +873,29 @@ function renderNodeToOutput(
 
         output.write(x, y, text, softWrap)
       }
-    } else if (node.nodeName === 'ink-box') {
+    } else if (
+      node.nodeName === 'ink-image' &&
+      imageAdmitted &&
+      output.terminalImagesEnabled
+    ) {
+      // Kitty placements use an extreme negative z-index so later terminal
+      // cells can cover them. A colored ancestor has already filled this
+      // rect, though, and those non-default-background cells would also hide
+      // the image itself. Replace only the image-owned cells with default-
+      // background spaces; layout and surrounding inherited color stay intact.
+      const imageWidth = Math.floor(width)
+      const imageHeight = Math.floor(height)
+      const imageLine = ' '.repeat(imageWidth)
+      output.write(
+        Math.floor(x),
+        Math.floor(y),
+        Array(imageHeight).fill(imageLine).join('\n'),
+      )
+      output.imageBacking(node)
+      for (const child of node.childNodes) {
+        if (child.nodeName !== '#text') dropSubtreeCache(child as DOMElement)
+      }
+    } else if (node.nodeName === 'ink-box' || node.nodeName === 'ink-image') {
       const boxBackgroundColor =
         node.style.backgroundColor ?? inheritedBackgroundColor
 
@@ -757,17 +980,78 @@ function renderNodeToOutput(
         // within the viewport (equal to the scroll container's
         // paddingTop), and innerHeight already subtracts padding, so
         // including it double-counts padding and inflates maxScroll.
-        const scrollHeight = contentYoga?.getComputedHeight() ?? 0
+        let scrollHeight = contentYoga?.getComputedHeight() ?? 0
+        // Defensive extent floor: the wrapper's Yoga height can land ONE LINE
+        // short of its children's laid-out extent (the engine's flex-basis
+        // measure cache and the child's final subtree layout can disagree by
+        // a row — measured on resume of a long session: wrapper 286 while the
+        // last row's bottom sat at 287, stable across forced re-layouts). A
+        // short scrollHeight clamps maxScroll below the real bottom, so the
+        // sticky pin parks the viewport a line up and the tail line culls
+        // against the viewport edge — permanently invisible AND unreachable
+        // (no scroll position ever shows it; the user loses the newest
+        // message). The children's real extent is the authoritative floor.
+        // O(direct children) — the windowed list keeps this tiny, and the
+        // painter walks the same nodes right below.
+        if (content !== undefined) {
+          for (const child of content.childNodes) {
+            const childYoga = (child as DOMElement).yogaNode
+            if (childYoga === undefined) continue
+            const bottom = childYoga.getComputedTop() + childYoga.getComputedHeight()
+            if (bottom > scrollHeight) scrollHeight = bottom
+          }
+        }
         // Capture previous scroll bounds BEFORE overwriting — the at-bottom
         // follow check compares against last frame's max.
         const prevScrollHeight = node.scrollHeight ?? scrollHeight
         const prevInnerHeight = node.scrollViewportHeight ?? innerHeight
+        const prevViewportTop = node.scrollViewportTop
         node.scrollHeight = scrollHeight
         node.scrollViewportHeight = innerHeight
         // Absolute screen-buffer row where the scrollable area (inside
         // padding) begins. Exposed via ScrollBoxHandle.getViewportTop() so
         // drag-to-scroll can detect when the drag leaves the scroll viewport.
         node.scrollViewportTop = (y1 ?? y) + padTop
+        // Viewport-edges change with no scroll delta (chrome mount/unmount
+        // around the box) — recorded for the selection translate in ink.tsx.
+        // prevViewportTop defined ⇒ a previous frame wrote both bounds, so
+        // prevInnerHeight is that frame's real height (the ?? fallback only
+        // fires on the first frame, which the prevViewportTop check skips).
+        const viewportBottom = node.scrollViewportTop + innerHeight - 1
+        const screenRowOffset =
+          prevViewportTop !== undefined &&
+          classifyViewportChange(
+            prevViewportTop,
+            prevViewportTop + prevInnerHeight - 1,
+            node.scrollViewportTop,
+            viewportBottom,
+          ) === 'translate'
+            ? node.scrollViewportTop - prevViewportTop
+            : 0
+        if (
+          prevViewportTop !== undefined &&
+          (node.scrollViewportTop !== prevViewportTop ||
+            viewportBottom !== prevViewportTop + prevInnerHeight - 1)
+        ) {
+          const prevViewportBottom = prevViewportTop + prevInnerHeight - 1
+          const kind = classifyViewportChange(
+            prevViewportTop,
+            prevViewportBottom,
+            node.scrollViewportTop,
+            viewportBottom,
+          )
+          viewportResizes.push({
+            delta: 0,
+            viewportTop: prevViewportTop,
+            viewportBottom: prevViewportBottom,
+            kind,
+            rowDelta: kind === 'translate' ? node.scrollViewportTop - prevViewportTop : 0,
+            prevTop: prevViewportTop,
+            prevBottom: prevViewportBottom,
+            top: node.scrollViewportTop,
+            bottom: viewportBottom,
+          })
+        }
 
         const maxScroll = Math.max(0, scrollHeight - innerHeight)
         // scrollAnchor: scroll so the anchored element's top is at the
@@ -855,11 +1139,12 @@ function renderNodeToOutput(
         const followDelta = (node.scrollTop ?? 0) - scrollTopBeforeFollow
         if (followDelta > 0) {
           const vpTop = node.scrollViewportTop ?? 0
-          followScroll = {
+          followScrolls.push({
             delta: followDelta,
             viewportTop: vpTop,
             viewportBottom: vpTop + innerHeight - 1,
-          }
+            screenRowOffset,
+          })
         }
         // Drain pendingScrollDelta. Native terminals (proportional burst
         // events) use proportional drain; xterm.js (VS Code, sparse events +
@@ -903,7 +1188,18 @@ function renderNodeToOutput(
         // Keep the pre-frame position on a shrink frame (measurement
         // artifact) instead of clamping to the shrunken maxScroll — the
         // clamp would persist the yank even after content grows back.
-        let scrollTop = shrunk ? cur : Math.max(0, Math.min(cur, maxScroll))
+        // Exception: a STICKY view must stay pinned to the bottom. A width
+        // change clears MessageList's row-height cache, collapsing the
+        // estimated scrollHeight; freezing the pre-shrink scrollTop then
+        // parks it PAST the whole shrunken content — every child culls and
+        // the frame paints only the bottom chrome. With the resize erase
+        // (needsEraseBeforePaint) that lands as a pure blank screen with
+        // just the input box, and an idle app produces no follow-up frame
+        // to heal it (user-reported full-screen loss on pane-width jitter —
+        // issue #421; repro-resize-blank). Clamping a sticky view to the shrunken
+        // maxScroll is exactly its contract — show the bottom.
+        let scrollTop =
+          shrunk && !sticky ? cur : Math.max(0, Math.min(cur, maxScroll))
         // Virtual-scroll clamp: if scrollTop raced past the currently-mounted
         // range (burst PageUp before React re-renders), render at the EDGE of
         // the mounted children instead of blank spacer. Do NOT write back to
@@ -912,15 +1208,69 @@ function renderNodeToOutput(
         // the right range. Not scheduling scrollDrainNode here keeps the
         // clamp passive — React's commit → resetAfterCommit → onRender will
         // paint again with fresh bounds.
+        // Cap both bounds at maxScroll: the clamp bounds come from
+        // MessageList's height ESTIMATES while maxScroll comes from the
+        // frame's actual Yoga height. A width change resets the estimates
+        // (row-height cache clear), and a stale bound can point PAST the
+        // shrunken content bottom — the painted viewport then sits entirely
+        // below the content and every child culls to blank (the sticky
+        // full-screen loss — issue #421; repro-resize-blank). Nothing renderable exists
+        // below maxScroll regardless of what the estimates claim.
         const clamped = Math.max(
-          cMin ?? -Infinity,
-          Math.min(scrollTop, cMax ?? Infinity),
+          Math.min(cMin ?? -Infinity, maxScroll),
+          Math.min(scrollTop, Math.min(cMax ?? Infinity, maxScroll)),
         )
         node.scrollTop = scrollTop
         // Clamp hitting top/bottom consumes any remainder. Set drainPending
         // only after clamp so a wasted no-op frame isn't scheduled.
         if (scrollTop !== cur) node.pendingScrollDelta = undefined
         if (node.pendingScrollDelta !== undefined) scrollDrainNode = node
+        // Geometry forensics (#421/#433): everything that decides where this
+        // viewport painted — captured AFTER all clamps so the trace shows the
+        // final renderScrollTop, not the requested one.
+        if (GEOMETRY_TRACE_ENABLED) {
+          noteScrollGeometry({
+            sticky,
+            shrunk,
+            grew,
+            atBottom,
+            scrollTopBeforeFollow,
+            cur,
+            scrollTop,
+            renderScrollTop: clamped,
+            scrollHeight,
+            prevScrollHeight,
+            innerHeight,
+            maxScroll,
+            prevMaxScroll,
+            clampMin: cMin ?? null,
+            clampMax: cMax ?? null,
+          })
+        }
+        // Wheel-drain selection translate (#438): the drain moved content
+        // by (scrollTop - scrollTopBeforeFollow) rows this frame, minus
+        // what at-bottom follow already reported above (followDelta is 0
+        // unless the follow branch fired — and when it did, it cleared
+        // pendingScrollDelta, so the drain contributed nothing). Record
+        // the remainder as a follow-scroll event with a SIGNED delta so
+        // ink.tsx re-anchors any active selection to the text. Without
+        // this, wheel scrolling leaves the highlight pinned to screen
+        // rows and copy-on-select grabs whatever scrolled under it.
+        // scrollTo/scrollToElement jumps never contribute: they write
+        // scrollTop before scrollTopBeforeFollow is captured. Multi-frame
+        // drains record per-frame portions; the selection's virtual-row
+        // tracking accumulates the clamp overshoot across frames. Multiple
+        // boxes may each record; ink.tsx attributes by viewport containment.
+        const wheelDelta = scrollTop - scrollTopBeforeFollow - followDelta
+        if (wheelDelta !== 0) {
+          const wheelVpTop = node.scrollViewportTop ?? 0
+          followScrolls.push({
+            delta: wheelDelta,
+            viewportTop: wheelVpTop,
+            viewportBottom: wheelVpTop + innerHeight - 1,
+            screenRowOffset,
+          })
+        }
         // A manual scroll that lands exactly on the bottom re-pins sticky
         // IMMEDIATELY on this frame — the follow-block restore above only
         // fires when a later frame happens, but an idle stream (turn done,
@@ -1007,12 +1357,25 @@ function renderNodeToOutput(
             !hint ||
             heightDelta === 0 ||
             (hint.delta > 0 && heightDelta === hint.delta)
+          const graphicsInScrollRegion =
+            hint !== null &&
+            output.hasPreviousImageInRegion(
+              Math.floor(x),
+              hint.top,
+              Math.floor(width),
+              hint.bottom - hint.top + 1,
+            )
           // scrollHint is set above when hint is captured. If safeForFastPath
           // is false the full path renders a next.screen that doesn't match
           // the DECSTBM shift — emitting DECSTBM leaves stale rows (seen as
           // content bleeding through during scroll-up + streaming). Clear it.
-          if (!safeForFastPath) scrollHint = null
-          if (hint && prevScreen && safeForFastPath) {
+          if (!safeForFastPath || graphicsInScrollRegion) scrollHint = null
+          if (
+            hint &&
+            prevScreen &&
+            safeForFastPath &&
+            !graphicsInScrollRegion
+          ) {
             const { top, bottom, delta } = hint
             const w = Math.floor(width)
             output.blit(prevScreen, Math.floor(x), top, w, bottom - top + 1)
@@ -1258,6 +1621,13 @@ function renderNodeToOutput(
         // Disable prevScreen for children: the fill overwrites the entire
         // interior each render, so child blits from prevScreen would restore
         // stale cells (wrong bg if it changed) on top of the fresh fill.
+        // Backdrop: shade whatever earlier nodes painted under this rect
+        // before this node's own fill and children go on top.
+        if (node.style.backdrop !== undefined) {
+          output.shade(
+            { x: Math.floor(x), y: Math.floor(y), width: Math.floor(width), height: Math.floor(height) },
+          )
+        }
         const ownBackgroundColor = node.style.backgroundColor
         if (ownBackgroundColor || node.style.opaque) {
           const borderLeft = yogaNode.getComputedBorder(LayoutEdge.Left)
@@ -1285,11 +1655,17 @@ function renderNodeToOutput(
           // backgroundColor and opaque both disable child blit: the fill
           // overwrites the entire interior each render, so any child whose
           // layout position shifted would blit stale cells from prevScreen
-          // on top of the fresh fill. Previously opaque kept blit enabled
-          // on the assumption that plain-space fill + unchanged children =
-          // valid composite, but children CAN reposition (ScrollBox remeasure
-          // on re-render → /permissions body blanked on Down arrow, #25436).
-          ownBackgroundColor || node.style.opaque ? undefined : prevScreen,
+          // on top of the fresh fill. bgChanged (effective background moved,
+          // e.g. a hover highlight removed) must disable child blit for the
+          // same reason: the old fill lives in prevScreen and the children's
+          // blits would resurrect it — the frame then equals prevScreen and
+          // the diff never clears the stale highlight.
+          node.nodeName === 'ink-image' ||
+            ownBackgroundColor ||
+            node.style.opaque ||
+            bgChanged
+            ? undefined
+            : prevScreen,
           boxBackgroundColor,
         )
       }
@@ -1315,10 +1691,19 @@ function renderNodeToOutput(
     }
 
     // Cache layout bounds for dirty tracking
-    const rect = { x, y, width, height, top: yogaTop }
+    const rect: CachedLayout = {
+      x,
+      y,
+      width,
+      height,
+      top: yogaTop,
+      bg: effectiveBg,
+      opaque: paintsOwnRect(node),
+    }
     nodeCache.set(node, rect)
     if (node.style.position === 'absolute') {
       absoluteRectsCur.push(rect)
+      absoluteHitList.push({ node, rect })
     }
     node.dirty = false
   }
@@ -1328,7 +1713,8 @@ function renderNodeToOutput(
 // AFTER a dirty/removed sibling can contain stale overflow in prevScreen.
 // Disable blit for siblings after a dirty child — but still pass prevScreen
 // TO the dirty child itself so its clean descendants can blit. The dirty
-// child's own blit check already fails (node.dirty=true at line 216), so
+// child's own blit check already fails (node.dirty=true, set by markDirty
+// in dom.ts), so
 // passing prevScreen only benefits its subtree.
 // For removed children we don't know their original position, so
 // conservatively disable blit for all.
@@ -1450,6 +1836,7 @@ function blitEscapingAbsoluteDescendants(
       const cached = nodeCache.get(elem)
       if (cached) {
         absoluteRectsCur.push(cached)
+        absoluteHitList.push({ node: elem, rect: cached })
         const cx = Math.floor(cached.x)
         const cy = Math.floor(cached.y)
         const cw = Math.floor(cached.width)

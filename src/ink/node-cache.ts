@@ -13,6 +13,16 @@ export type CachedLayout = {
   width: number
   height: number
   top?: number
+  /** Effective background color (own ?? inherited) at the last render.
+   *  Renderer compares it per frame so a background change refuses the
+   *  prevScreen blit — children would otherwise resurrect the stale color
+   *  (stuck hover highlight). */
+  bg?: string
+  /** Whether the node fills its whole rect (own backgroundColor or
+   *  `opaque`). Only such an absolute node "covers" cells a previous
+   *  overlay vacated; a transparent one leaves them stale (see
+   *  hasOverlayVacatedCells). */
+  opaque?: boolean
 }
 
 /** Layout bounds cached per rendered node, used for blitting and clearing. */
