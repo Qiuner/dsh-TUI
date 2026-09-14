@@ -1,7 +1,8 @@
-import React, { type ReactNode } from 'react'
+import React, { type ReactNode, useState } from 'react'
 import { Box, Text } from '../../ui.js'
 import { useDeclaredCursor } from '../../ink/hooks/use-declared-cursor.js'
-import { POINTER, DOWN_ARROW, UP_ARROW, TICK } from '../../cc/figures.js'
+import type { ClickEvent } from '../../ink/events/click-event.js'
+import { POINTER, DOWN_ARROW, UP_ARROW, TICK } from '../../terminal-utils/figures.js'
 
 export type ListItemProps = {
   /** Whether this item is currently focused (keyboard selection).
@@ -28,13 +29,18 @@ export type ListItemProps = {
    * @default true
    */
   declareCursor?: boolean
+  /**
+   * Mouse click handler (fullscreen mode). When provided the row becomes
+   * clickable and gains a subtle hover background so the affordance is
+   * visible; when absent the row renders exactly as before.
+   */
+  onClick?: (event: ClickEvent) => void
 }
 
 /**
- * A list item for selection UIs, mirroring Claude Code's
- * design-system/ListItem.tsx: `❯` pointer for the focused row, `✓`
+ * A list item for selection UIs: `❯` marks the focused row, `✓`
  * checkmark for the selected row, description on an indented second line,
- * and CC's color states (focused = suggestion blue, selected = success
+ * and its color states (focused = suggestion blue, selected = success
  * green).
  */
 export function ListItem({
@@ -47,15 +53,21 @@ export function ListItem({
   styled = true,
   disabled = false,
   declareCursor,
+  onClick,
 }: ListItemProps): React.ReactNode {
   // Park the native terminal cursor on the pointer indicator so screen
-  // readers / magnifiers track the focused item (CC behavior). (0,0) is the
+  // readers / magnifiers track the focused item. (0,0) is the
   // top-left of this Box, where the pointer renders.
   const cursorRef = useDeclaredCursor({
     line: 0,
     column: 0,
     active: isFocused && !disabled && declareCursor !== false,
   })
+  // Hover highlight only when the row is actually clickable — the extra
+  // background is the mouse affordance (there is no cursor-shape feedback
+  // in a terminal).
+  const [hovered, setHovered] = useState(false)
+  const clickable = Boolean(onClick) && !disabled
 
   function renderIndicator(): ReactNode {
     if (disabled) {
@@ -92,11 +104,24 @@ export function ListItem({
   const flatChildren = flattenDeep(children)
 
   return (
-    <Box ref={cursorRef} flexDirection="column">
-      <Box flexDirection="row" gap={1}>
+    <Box
+      ref={cursorRef}
+      flexDirection="column"
+      onClick={clickable ? onClick : undefined}
+      onMouseEnter={clickable ? () => setHovered(true) : undefined}
+      onMouseLeave={clickable ? () => setHovered(false) : undefined}
+      backgroundColor={clickable && hovered ? 'userMessageBackgroundHover' : undefined}
+    >
+      {/* 行高恒 1、不压缩、溢出隐藏：压边换行会把每个列表项膨胀成 2 个
+          屏幕行，与 listWindow 按每项申报的高度失配——浮层顶行被裁、真
+          终端上换行泄入 scrollback 使行寻址错位、翻页错位累加（#396）。
+          选中 ✓ 仍作为独立列保留：行容器溢出隐藏后，长名截断不会因尾部
+          ✓ 把整行撑成两行，且 ✓ 不会被 truncate-end 截掉（与 e43021a
+          边框行加固同族）。 */}
+      <Box flexDirection="row" gap={1} height={1} flexShrink={0} overflow="hidden" width="100%">
         {renderIndicator()}
         {styled ? (
-          <Text color={getTextColor()} dimColor={disabled} wrap="truncate">
+          <Text color={getTextColor()} dimColor={disabled} wrap="truncate-end">
             {flatChildren}
           </Text>
         ) : (

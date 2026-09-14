@@ -15,14 +15,32 @@ export const OSC_PREFIX = ESC + String.fromCharCode(ESC_TYPE.OSC)
 export const ST = ESC + '\\'
 
 /**
+ * Characters that must never appear inside an OSC payload: C0/C1 controls
+ * terminate or smuggle sequences past the payload boundary (BEL and ST are
+ * terminators, ESC starts a new sequence, C1 bytes mean the same on 8-bit
+ * terminals). Space is NOT stripped here — titles and notification texts
+ * legitimately contain it; the one payload where a raw space is unsafe
+ * (the OSC 8 URI) strips it at the hyperlink entry (sanitizeHyperlinkUrl).
+ * Untrusted text (model output, plugin messages, session titles) reaches
+ * OSC constructors; stripping here is the single choke point that keeps
+ * injected sequences out of the terminal.
+ */
+const OSC_PAYLOAD_UNSAFE = /[\x00-\x1f\x7f-\x9f]/g
+
+function sanitizeOscPart(part: string | number): string | number {
+  return typeof part === 'number' ? part : part.replace(OSC_PAYLOAD_UNSAFE, '')
+}
+
+/**
  * Generate an OSC sequence: ESC ] p1;p2;...;pN <terminator>.
  * Uses the ST terminator for Kitty (avoids beeps) and BEL for others.
- * @param parts - the sequence parts, joined by semicolons.
+ * @param parts - the sequence parts, joined by semicolons. Control
+ * characters inside string parts are stripped (see OSC_PAYLOAD_UNSAFE).
  * @returns the complete OSC sequence string.
  */
 export function osc(...parts: (string | number)[]): string {
   const terminator = env.terminal === 'kitty' ? ST : BEL
-  return `${OSC_PREFIX}${parts.join(SEP)}${terminator}`
+  return `${OSC_PREFIX}${parts.map(sanitizeOscPart).join(SEP)}${terminator}`
 }
 
 /**
@@ -125,17 +143,16 @@ export async function tmuxLoadBuffer(text: string): Promise<boolean> {
  * detach/reattach, immune to stale env vars. The -w flag (tmux 3.2+) tells
  * tmux to also propagate to the outer terminal via its own OSC 52 path,
  * which tmux wraps correctly for the attached client. On older tmux, -w is
- * ignored and the buffer is still loaded. -w is dropped for iTerm2 (#22432)
+ * ignored and the buffer is still loaded. -w is dropped for iTerm2
  * because tmux's own OSC 52 emission (empty selection param: ESC]52;;b64)
  * crashes iTerm2 over SSH.
  *
  * After load-buffer succeeds, we ALSO return a DCS-passthrough-wrapped
  * OSC 52 for the caller to write to stdout. Our sequence uses explicit `c`
- * (not tmux's crashy empty-param variant), so it sidesteps the #22432 path.
+ * (not tmux's crashy empty-param variant), so it sidesteps the empty-selector path.
  * With `allow-passthrough on` + an OSC-52-capable outer terminal, selection
  * reaches the system clipboard; with either off, tmux silently drops the
- * DCS and prefix+] still works. See Greg Smith's "free pony" in
- * https://anthropic.slack.com/archives/C07VBSHV7EV/p1773177228548119.
+ * DCS and prefix+] still works.
  *
  * If load-buffer fails entirely, fall through to raw OSC 52.
  *
@@ -158,8 +175,7 @@ export async function setClipboard(text: string): Promise<string> {
   // Native safety net — fire FIRST, before the tmux await, so a quick
   // focus-switch after selecting doesn't race pbcopy. Previously this ran
   // AFTER awaiting tmux load-buffer, adding ~50-100ms of subprocess latency
-  // before pbcopy even started — fast cmd+tab → paste would beat it
-  // (https://anthropic.slack.com/archives/C07VBSHV7EV/p1773943921788829).
+  // before pbcopy even started — fast cmd+tab → paste would beat it.
   // Gated on SSH_CONNECTION (not SSH_TTY) since tmux panes inherit SSH_TTY
   // forever but SSH_CONNECTION is in tmux's default update-environment and
   // clears on local attach. Fire-and-forget.
@@ -431,11 +447,16 @@ function* splitTabStatusPairs(data: string): Generator<[string, string]> {
  */
 export function link(url: string, params?: Record<string, string>): string {
   if (!url) return LINK_END
-  const p = { id: osc8Id(url), ...params }
+  // A raw space is unsafe in the OSC 8 URI form specifically; titles and
+  // notification payloads keep theirs, so this lives here, not in osc().
+  // Encoded, not deleted — `file:///C:/My Project/x` must keep pointing
+  // at the same path when round-tripped through the terminal.
+  const safeUrl = url.replaceAll(' ', '%20')
+  const p = { id: osc8Id(safeUrl), ...params }
   const paramStr = Object.entries(p)
-    .map(([k, v]) => `${k}=${v}`)
+    .map(([k, v]) => `${k}=${v.replaceAll(' ', '')}`)
     .join(':')
-  return osc(OSC.HYPERLINK, paramStr, url)
+  return osc(OSC.HYPERLINK, paramStr, safeUrl)
 }
 
 function osc8Id(url: string): string {
@@ -484,19 +505,9 @@ export const CLEAR_TAB_STATUS = osc(
   'indicator=;status=;status-color=',
 )
 
-/**
- * Gate for emitting OSC 21337 (tab-status indicator). Ant-only while the
- * spec is unstable. Terminals that don't recognize it discard silently, so
- * emission is safe unconditionally — we don't gate on terminal detection
- * since support is expected across several terminals.
- *
- * Callers must wrap output with wrapForMultiplexer() so tmux/screen
- * DCS-passthrough carries the sequence to the outer terminal.
- * @returns true when the current user is Ant, the only environment emitting
- *   OSC 21337 today.
- */
+/** Enable experimental tab status only when explicitly requested by the terminal owner. */
 export function supportsTabStatus(): boolean {
-  return process.env.USER_TYPE === 'ant'
+  return process.env.DSH_TUI_TAB_STATUS === '1'
 }
 
 /**

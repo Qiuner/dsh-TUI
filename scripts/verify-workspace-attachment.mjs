@@ -119,7 +119,17 @@ try {
 }
 
 const plugin = readFileSync(new URL('../src/dsh-adapter/plugin.ts', import.meta.url), 'utf8')
-const channel = readFileSync(new URL('../src/dsh-adapter/channel.ts', import.meta.url), 'utf8')
+const channel = [
+  'channel.ts',
+  'channel/model-switch.ts',
+  'channel/session-resume.ts',
+  'channel/session-rewind.ts',
+  'channel/session-fork.ts',
+  'channel/session-tree-actions.ts',
+  'channel/session-live-adoption.ts',
+  'channel/background-action.ts',
+  'channel/agent-view-projection.ts',
+].map(path => readFileSync(new URL(`../src/dsh-adapter/${path}`, import.meta.url), 'utf8')).join('\n')
 const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
 assert.match(
   plugin,
@@ -128,12 +138,17 @@ assert.match(
 )
 assert.doesNotMatch(plugin, /if \(created\)/, 'startup attachment must not skip resumed legacy sessions')
 assert.equal(
-  [...channel.matchAll(/await attachSessionToWorkspace\(ctx, (?:state\.cwd|handle\.agent\.session\.header\.cwd \?\? state\.cwd), (?:SessionId\(sessionId\)|childId|sessionId)\)/g)].length,
-  4,
-  'rewind, /resume, /new, and model-switch paths all attach ownership',
+  [...channel.matchAll(/await attachSessionToWorkspace\(ctx, (?:state\.cwd|targetCwd|deps\.cwd\(\)|handle\.agent\.session\.header\.cwd \?\? state\.cwd|sourceCwd), (?:SessionId\(sessionId\)|childId|sessionId)\)/g)].length,
+  8,
+  'rewind, /resume, /new, model-switch, tree rewindToNode, /fork, and agent-view background paths all attach ownership across extracted actions',
 )
 for (const id of ['storage', 'storage-json', 'storage-domain', 'workspace']) {
-  assert.match(patch, new RegExp(`- id: ${id}\\n`), `profile patch mounts ${id}`)
+  assert.match(patch, new RegExp(`- id: dsh-tui-${id}\\n`), `profile patch mounts scoped dsh-tui-${id}`)
+  assert.match(
+    patch,
+    new RegExp(`dsh-tui-${id}[\\s\\S]{0,260}entry\\.options\\.id === '${id}'`),
+    `scoped dsh-tui-${id} yields to the official ${id} row`,
+  )
 }
 assert.match(patch, /root: !!js dshHomePath\('storages'\)/)
 assert.match(

@@ -7,8 +7,7 @@ import { useTheme } from './ThemeProvider.js'
 
 /**
  * Colors uncolored ThemedText in the subtree. Precedence: explicit `color` >
- * this > dimColor (in the Claude Code visual language, where message rows
- * set it to `text` on hover).
+ * this > dimColor. Message rows set it to `text` on hover.
  */
 export const TextHoverColorContext = React.createContext<
   keyof Theme | undefined
@@ -29,8 +28,8 @@ function resolveColor(
   ) {
     return color as Color
   }
-  // It's a theme key - resolve it
-  return theme[color as keyof Theme] as Color
+  // It's a theme key - resolve it ('' means "no color" in that theme)
+  return (theme[color as keyof Theme] as Color) || undefined
 }
 
 export type Props = {
@@ -91,8 +90,8 @@ export type Props = {
 
 /**
  * Theme-aware Text component that resolves theme color keys to raw colors
- * (in the Claude Code visual language). This is what lets every ported CC
- * component use `color="subtle"`-style theme keys unchanged.
+ * in the dsh-TUI visual language). This lets components use
+ * `color="subtle"`-style theme keys consistently.
  */
 export default function ThemedText({
   color,

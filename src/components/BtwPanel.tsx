@@ -6,8 +6,8 @@ import { t } from '../i18n.js'
 import { isPlainReturnInput } from '../utils/modifiers.js'
 
 /**
- * /btw side-question panel (CC's btw.tsx, inline-pane form like the local
- * pickers): title line with the question, a scrollable answer body (error /
+ * /btw side-question panel, an inline-pane form like the local pickers:
+ * title line with the question, a scrollable answer body (error /
  * markdown answer / answering spinner), and a hint line. Owns the keyboard
  * while open — every key it sees is consumed here.
  */
@@ -80,9 +80,12 @@ export function BtwPanel({
           </ScrollBox>
         </Box>
       </Box>
-      <Text dimColor>
-        {settled ? t('btw-hint-done') : streaming ? t('btw-hint-loading') : t('btw-hint-done')}
-      </Text>
+      {/* 提示行可点击复制（与 c 键同路径，审计 C-19） */}
+      <Box onClick={settled ? onCopy : undefined}>
+        <Text dimColor>
+          {settled ? t('btw-hint-done') : streaming ? t('btw-hint-loading') : t('btw-hint-done')}
+        </Text>
+      </Box>
     </Box>
   )
 }

@@ -14,6 +14,8 @@ export type Key = {
   pageUp: boolean
   wheelUp: boolean
   wheelDown: boolean
+  wheelLeft: boolean
+  wheelRight: boolean
   home: boolean
   end: boolean
   return: boolean
@@ -26,6 +28,23 @@ export type Key = {
   delete: boolean
   meta: boolean
   super: boolean
+  /**
+   * Pointer column (0-indexed) when the key is a wheel event — the SGR/X10
+   * sequence carries the position. Undefined for non-wheel keys.
+   */
+  mouseCol?: number
+  /** Pointer row (0-indexed) when the key is a wheel event. See mouseCol. */
+  mouseRow?: number
+  /**
+   * True when this input arrived as a bracketed paste (terminal paste —
+   * Ctrl+Shift+V / right-click / a terminal that intercepts Ctrl+V) rather
+   * than typed characters. Mirrors `InputEvent.isPasted` so modal handlers
+   * can treat a paste chunk as text without reaching for the third callback
+   * argument: pasted content — even a chunk that is all line breaks — is
+   * never an Enter/submit press. Optional so hand-built key literals (tests,
+   * synthetic dispatches) keep compiling; the live pipeline always sets it.
+   */
+  isPasted?: boolean
 }
 
 function parseKey(keypress: ParsedKey): [Key, string] {
@@ -38,6 +57,8 @@ function parseKey(keypress: ParsedKey): [Key, string] {
     pageUp: keypress.name === 'pageup',
     wheelUp: keypress.name === 'wheelup',
     wheelDown: keypress.name === 'wheeldown',
+    wheelLeft: keypress.name === 'wheelleft',
+    wheelRight: keypress.name === 'wheelright',
     home: keypress.name === 'home',
     end: keypress.name === 'end',
     return: keypress.name === 'return',
@@ -57,6 +78,9 @@ function parseKey(keypress: ParsedKey): [Key, string] {
     // protocol CSI u sequences. Distinct from meta (Alt/Option) so
     // bindings like cmd+c can be expressed separately from opt+c.
     super: keypress.super,
+    isPasted: keypress.isPasted === true,
+    mouseCol: keypress.mouseCol,
+    mouseRow: keypress.mouseRow,
   }
 
   let input = keypress.ctrl ? keypress.name : keypress.sequence

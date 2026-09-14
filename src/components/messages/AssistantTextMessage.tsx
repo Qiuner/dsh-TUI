@@ -1,35 +1,37 @@
 import React from 'react'
 import { Box, NoSelect, Text } from '../../ui.js'
-import { BLACK_CIRCLE } from '../../cc/figures.js'
+import { BLACK_CIRCLE } from '../../terminal-utils/figures.js'
 import { Markdown } from '../Markdown.js'
 
 type Props = {
   text: string
-  /** Adds the top margin between messages (CC: addMargin). */
-  addMargin: boolean
+  /** Adds the top margin between messages. */
+  marginTopOnTurn: boolean
   /** Message-selection mode highlight. */
   isSelected?: boolean
-  /** Row expanded on its own (persistent hover-grey background, CC). */
+  /** Row expanded on its own (persistent hover-grey background). */
   isExpanded?: boolean
-  onClick?(): void
 }
 
 /**
- * Assistant text message:  bullet + markdown body (mirroring Claude Code's  default branch).
+ * Assistant text message: bullet + markdown body.
+ *
+ * Deliberately not clickable: the transcript is reading material and the
+ * mouse's job there is text selection (user feedback — row hover tints and
+ * fold toggling were noise, not affordance).
  */
 export function AssistantTextMessage({
   text,
-  addMargin,
+  marginTopOnTurn,
   isSelected = false,
   isExpanded = false,
-  onClick,
 }: Props): React.ReactNode {
   return (
     <Box
       alignItems="flex-start"
       flexDirection="row"
       justifyContent="space-between"
-      marginTop={addMargin ? 1 : 0}
+      marginTop={marginTopOnTurn ? 1 : 0}
       width="100%"
       backgroundColor={
         isSelected
@@ -38,7 +40,6 @@ export function AssistantTextMessage({
             ? 'userMessageBackgroundHover'
             : undefined
       }
-      onClick={onClick}
     >
       <Box flexDirection="row">
         <NoSelect fromLeftEdge minWidth={2}>

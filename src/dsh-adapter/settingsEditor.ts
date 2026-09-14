@@ -1,3 +1,5 @@
+import type { SettingsHost, SettingsNamespaceView, SettingsPathOp } from '../adapter/ports/channel-settings.js'
+export type { SettingsHost, SettingsNamespaceView, SettingsPathOp } from '../adapter/ports/channel-settings.js'
 /**
  * React-free form model behind the `/settings` screen (issue #165), mirroring
  * the web front door's card-form.ts semantics: a section stages what the user
@@ -18,40 +20,6 @@
  */
 
 import type { TuiSettingsField, TuiSettingsFieldWrite } from './settings-sections.js'
-
-/** One settings namespace as the screen reads it (secrets redacted). */
-export interface SettingsNamespaceView {
-  readonly ns: string
-  /** Monotonic revision of the raw user section; fences writes. */
-  readonly revision: number
-  /** 'live' applies immediately; 'restart' needs a relaunch. */
-  readonly applies: 'live' | 'restart'
-  /** Current resolved value (all layers composed). */
-  readonly value: unknown
-  /** Raw user layer; a path present here is a user override. */
-  readonly user: unknown
-}
-
-/**
- * Runtime capabilities the settings screen needs, implemented by the channel
- * over the dsh `settings` / `credentials` seams. `undefined` from
- * `channel.settingsHost()` means the composition lacks them (bare cordis.yml
- * start) and the screen shows namespaces read-only.
- */
-export interface SettingsHost {
-  /** Every registered namespace, secrets redacted, in registration order. */
-  listNamespaces(): readonly SettingsNamespaceView[]
-  /** Write path ops against a namespace, fenced by its current revision. */
-  write(ns: string, ops: readonly SettingsPathOp[], expectedRevision?: number): Promise<void>
-  /** Whether any layer supplies a credential under `ref`. */
-  credentialConfigured(ref: string): Promise<boolean>
-  /** Persist a credential; rejects when env-shadowed or the store is read-only. */
-  writeCredential(ref: string, value: string): Promise<void>
-}
-
-export type SettingsPathOp =
-  | { op: 'set'; path: readonly string[]; value: unknown }
-  | { op: 'unset'; path: readonly string[] }
 
 /** One field as the screen renders it. */
 export interface SettingsFieldState {
@@ -75,6 +43,9 @@ export interface SettingsSectionShell {
   saving: boolean
   /** Whether the last save failed; cleared by the next edit or save. */
   failed: boolean
+  /** Why the last save failed, when the writer said so (e.g. a reserved
+   * credential ref); shown verbatim so refusals are not just "failed". */
+  failureMessage?: string
 }
 
 /** Read a nested value by path (array indexes as strings). */
@@ -160,6 +131,7 @@ export class SettingsForm {
   private readonly edits = new Map<string, StagedEdit>()
   saving = false
   failed = false
+  failureMessage: string | undefined = undefined
 
   constructor(
     private readonly host: SettingsHost,
@@ -210,6 +182,7 @@ export class SettingsForm {
       invalid,
       saving: this.saving,
       failed: this.failed,
+      failureMessage: this.failed ? this.failureMessage : undefined,
     }
   }
 
@@ -221,19 +194,25 @@ export class SettingsForm {
   /** Stage draft text for one field. */
   edit(field: TuiSettingsField, text: string): void {
     this.edits.set(fieldKey(field), { text, clear: false })
-    this.failed = false
+    this.clearFailure()
   }
 
   /** Stage a clear, so saving lets the field re-inherit the composition layer. */
   resetField(field: TuiSettingsField): void {
     this.edits.set(fieldKey(field), { text: '', clear: true })
-    this.failed = false
+    this.clearFailure()
   }
 
   /** Drop every staged edit. */
   discard(): void {
     this.edits.clear()
+    this.clearFailure()
+  }
+
+  /** A new edit or save cycle retires the last failure's explanation. */
+  private clearFailure(): void {
     this.failed = false
+    this.failureMessage = undefined
   }
 
   /** Whether any staged draft is invalid, which blocks the save. */
@@ -273,6 +252,7 @@ export class SettingsForm {
         : { op: 'set', path: field.path, value: write.value })
     }
     this.saving = true
+    this.clearFailure()
     try {
       if (ops.length > 0) {
         try {
@@ -293,8 +273,12 @@ export class SettingsForm {
       }
       this.failed = false
       return true
-    } catch {
+    } catch (error) {
       this.failed = true
+      // Guarded rejections (reserved credential refs, …) carry their own
+      // localized explanation — keep it for the screen to show verbatim
+      // instead of a generic "save failed".
+      this.failureMessage = error instanceof Error && error.message !== '' ? error.message : undefined
       return false
     } finally {
       this.saving = false

@@ -7,8 +7,8 @@ import { HintLine } from './design-system/HintLine.js'
 import type { PresetOption } from '../dsh-adapter/channel.js'
 
 /**
- * Agent-preset picker (issue #8) in the CC ModelPicker style — same chrome
- * as the ActivityPicker: a permission-colored Pane listing every roster
+ * Agent-preset picker (issue #8) using the ActivityPicker layout: a
+ * permission-colored Pane listing every roster
  * preset with its display name and description, `❯` focus pointer and `✓`
  * on the preset the current session runs. Enter applies through
  * `channel.switchPreset`, Esc cancels. Broken presets are listed (the
@@ -19,10 +19,14 @@ export function PresetPicker({
   presets,
   focusIndex,
   currentPreset,
+  onPick,
 }: {
   presets: readonly PresetOption[]
   focusIndex: number
   currentPreset: string | undefined
+  /** Mouse pick (fullscreen): clicked row's absolute index (Chat applies
+   *  the same code path as the keyboard Enter). */
+  onPick?: (index: number) => void
 }): React.ReactNode {
   return (
     <Pane color="permission">
@@ -43,6 +47,7 @@ export function PresetPicker({
           }))}
           focusIndex={focusIndex}
           selectedValue={currentPreset}
+          onPick={onPick ? index => onPick(index) : undefined}
         />
         <Text dimColor italic>
           <HintLine text={t('hint-confirm-exit')} />

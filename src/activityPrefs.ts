@@ -10,7 +10,8 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { isPresetName } from './components/activityFrames.js'
+import { isPresetName, normalizeActivityPreset } from './components/activityFrames.js'
+import { parseWorkingActivityConfig, type WorkingActivityConfig } from 'dsh-working-activity/config'
 import { DATA_DIR } from './utils/paths.js'
 
 const PREFS_DIR = DATA_DIR
@@ -25,7 +26,7 @@ export function parseActivityFrames(text: string): string | undefined {
     const parsed: unknown = JSON.parse(text)
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
     const frames = (parsed as Record<string, unknown>).frames
-    return typeof frames === 'string' && isPresetName(frames) ? frames : undefined
+    return typeof frames === 'string' && isPresetName(frames) ? normalizeActivityPreset(frames) : undefined
   } catch {
     return undefined
   }
@@ -45,6 +46,22 @@ export function readActivityFrames(dir: string = PREFS_DIR): string | undefined 
 }
 
 /**
+ * Read the full pi-style working-activity config (frames / mode / features /
+ * customPhrases / customActions / narrate / thresholds) from the same JSON
+ * file the `/activity` command writes, parsed by the wa package. Best-effort:
+ * a missing or corrupt file yields undefined (callers use their defaults).
+ * @param dir - Prefs directory (injectable for tests).
+ * @returns The parsed config, or undefined when unreadable.
+ */
+export function readActivityConfig(dir: string = PREFS_DIR): WorkingActivityConfig | undefined {
+  try {
+    return parseWorkingActivityConfig(readFileSync(join(dir, 'working-activity.json'), 'utf8')).config
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Persist the chosen indicator preset (best effort).
  * @param name - Preset name to persist.
  * @param dir - Prefs directory (injectable for tests).
@@ -53,7 +70,7 @@ export function readActivityFrames(dir: string = PREFS_DIR): string | undefined 
 export function writeActivityFrames(name: string, dir: string = PREFS_DIR): boolean {
   try {
     mkdirSync(dir, { recursive: true })
-    writeFileSync(join(dir, 'working-activity.json'), JSON.stringify({ frames: name }, null, 2))
+    writeFileSync(join(dir, 'working-activity.json'), JSON.stringify({ frames: normalizeActivityPreset(name) }, null, 2))
     return true
   } catch {
     return false

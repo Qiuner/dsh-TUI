@@ -13,10 +13,32 @@ export type CachedLayout = {
   width: number
   height: number
   top?: number
+  /** Effective background color (own ?? inherited) at the last render.
+   *  Renderer compares it per frame so a background change refuses the
+   *  prevScreen blit — children would otherwise resurrect the stale color
+   *  (stuck hover highlight). */
+  bg?: string
+  /** Whether the node fills its whole rect (own backgroundColor or
+   *  `opaque`). Only such an absolute node "covers" cells a previous
+   *  overlay vacated; a transparent one leaves them stale (see
+   *  hasOverlayVacatedCells). */
+  opaque?: boolean
 }
 
 /** Layout bounds cached per rendered node, used for blitting and clearing. */
 export const nodeCache = new WeakMap<DOMElement, CachedLayout>()
+
+/** Current prepared text only: scrolling changes its position, not its lines.
+ * Weak keys release unmounted nodes; mutations discard the previous version. */
+export const textPaintCache = new WeakMap<DOMElement, {
+  maxWidth: number
+  background: string | undefined
+  paddingLeft: number
+  paddingTop: number
+  text: string
+  lines: readonly string[]
+  softWrap: boolean[] | undefined
+}>()
 
 /** Rects of removed children that need clearing on next render */
 export const pendingClears = new WeakMap<DOMElement, Rectangle[]>()

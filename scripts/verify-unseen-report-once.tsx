@@ -18,8 +18,7 @@ import { PassThrough, Writable } from 'node:stream'
 import React from 'react'
 import { render } from '../src/ui.js'
 import { MessageList } from '../src/components/MessageList.js'
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+import { sleep } from './lib/term-test.mjs'
 
 class Output extends Writable {
   columns = 100
@@ -54,6 +53,8 @@ const props = {
   expandedRows: new Set<number>(),
   selectedId: null,
   onToggleRow: () => {},
+  streamFoldedRows: new Set<number>(),
+  onToggleStreamFold: () => {},
   model: 'deepseek-chat',
   showAll: true,
   onToggleAll: () => {},
@@ -71,7 +72,10 @@ const instance = await render(<MessageList rows={rows} {...props} />, {
   patchConsole: false,
 })
 
-// Let measurements settle (heights land, base corrects, count stabilizes).
+// 固定窗:探针 the baseline below is "reports have STOPPED arriving" — the
+// window lets measurements settle (heights land, base corrects, count
+// stabilizes); polling for the first positive report would capture settledLen
+// too early and misread later settling reports as no-op re-reports.
 await sleep(500)
 const settledLen = reports.length
 const settledValue = reports[settledLen - 1]
@@ -84,6 +88,8 @@ if (settledLen === 0 || settledValue === undefined || settledValue <= 0) {
 // count changes, so a correct report stays silent.
 for (let i = 0; i < 6; i++) {
   instance.rerender(<MessageList rows={rows} {...props} />)
+  // 固定窗:探针 no-op commits must NOT re-report — a wrong re-report needs a
+  // window to show up; settling on the already-true "no new report" is a no-op.
   await sleep(60)
 }
 const afterNoop = reports.length
@@ -99,6 +105,8 @@ if (afterNoop !== settledLen) {
 // A real change MUST still report exactly once: append a new row below the fold.
 rows.push({ id: 31, kind: 'assistant', text: 'fresh row\nwith two lines', streaming: false })
 instance.rerender(<MessageList rows={rows} {...props} />)
+// 固定窗:探针 the assertion is "EXACTLY one new report" — a duplicate must NOT
+// land; settling on the first report would return before one could.
 await sleep(300)
 const finalLen = reports.length
 if (finalLen !== settledLen + 1 || reports[finalLen - 1] === settledValue) {

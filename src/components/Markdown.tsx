@@ -1,16 +1,16 @@
 import React from 'react'
 import { marked, type Token, type Tokens } from 'marked'
 import { Box, Text } from '../ui.js'
-import { configureMarked, formatToken, stripPromptXMLTags } from '../cc/markdown.js'
-import { getCliHighlightPromise, type CliHighlight } from '../cc/cliHighlight.js'
+import { configureMarked, formatToken, stripPromptXMLTags } from '../terminal-utils/markdown.js'
+import { getCliHighlightPromise, type CliHighlight } from '../terminal-utils/cliHighlight.js'
 import { MarkdownTable } from './MarkdownTable.js'
 
 /**
  * Markdown 渲染组件：marked 分词 + ANSI 格式化。
  *
  * 表格 token 交给 MarkdownTable 渲染为带边框的 flexbox 布局；
- * 其余块级内容由 formatToken 转成 ANSI 字符串，合并后包进单个
- * Text（整段去首尾空白）。代码块高亮由 cli-highlight 异步提供，
+ * 其余块级内容由 formatToken 转成 ANSI 字符串，按块边界分批放进
+ * Text（只去整段首尾空白）。代码块高亮由 cli-highlight 异步提供，
  * 加载完成后自动触发一次重渲染。无 markdown 语法的纯文本走快速
  * 路径，直接合成段落 token，省掉 lexer 调用。
  */
@@ -36,6 +36,7 @@ type Props = {
 const TOKEN_CACHE_CAPACITY = 200
 const TOKEN_CACHE_CHAR_BUDGET = 200_000
 const TOKEN_CACHE_MAX_SOURCE_LENGTH = 20_000
+const TEXT_BLOCK_BUDGET = 8192
 const tokenCache = new Map<string, Token[]>()
 let tokenCacheChars = 0
 
@@ -76,12 +77,20 @@ function lexWithCache(content: string, allowCache: boolean): Token[] {
   const tokens = marked.lexer(content)
   if (content.length > TOKEN_CACHE_MAX_SOURCE_LENGTH) return tokens
 
-  if (
+  // Evict oldest entries (Map preserves insertion order) until both the
+  // count and char budgets fit. The previous full clear() nuked the whole
+  // cache every time a long session crossed 200 blocks — every subsequent
+  // row remount then re-ran the lexer (scroll-through-a-long-session
+  // stutter); evicting only what the newcomer displaces keeps the working
+  // set warm.
+  while (
     tokenCache.size >= TOKEN_CACHE_CAPACITY ||
     tokenCacheChars + content.length > TOKEN_CACHE_CHAR_BUDGET
   ) {
-    tokenCache.clear()
-    tokenCacheChars = 0
+    const oldest = tokenCache.keys().next().value
+    if (oldest === undefined) break
+    tokenCache.delete(oldest)
+    tokenCacheChars -= oldest.length
   }
   tokenCache.set(content, tokens)
   tokenCacheChars += content.length
@@ -90,7 +99,7 @@ function lexWithCache(content: string, allowCache: boolean): Token[] {
 
 /**
  * 把 lexer 产出的 token 列表转成 React 节点序列：table 独立渲染，
- * 其余 token 的 ANSI 文本先累积拼接，再统一包成 Text（去除首尾空白）。
+ * 其余 token 的 ANSI 文本按完整块分批拼接，只去整段首尾空白。
  */
 function renderTokensToNodes(
   tokens: Token[],
@@ -99,15 +108,32 @@ function renderTokensToNodes(
 ): React.ReactNode[] {
   const nodes: React.ReactNode[] = []
   let ansiText = ''
+  let textParts: string[] = []
 
   const flushAnsiText = (): void => {
-    if (!ansiText) return
-    nodes.push(
-      <Text key={nodes.length} dimColor={dimColor}>
-        {ansiText.trim()}
-      </Text>,
-    )
+    if (!ansiText && textParts.length === 0) return
+    if (textParts.length === 0) {
+      nodes.push(<Text key={nodes.length} dimColor={dimColor}>{ansiText.trim()}</Text>)
+    } else {
+      textParts.push(ansiText)
+      let first = 0
+      let last = textParts.length - 1
+      while (first < last && textParts[first]!.trimStart() === '') first++
+      while (last > first && textParts[last]!.trimEnd() === '') last--
+      textParts[first] = textParts[first]!.trimStart()
+      textParts[last] = textParts[last]!.trimEnd()
+      // Each internal boundary replaces exactly one source newline with a
+      // column-child boundary. Only the whole text span trims outer space.
+      nodes.push(
+        <Box key={nodes.length} flexDirection="column">
+          {textParts.slice(first, last + 1).map((part, index) => (
+            <Text key={index} dimColor={dimColor}>{index + first < last ? part.slice(0, -1) : part}</Text>
+          ))}
+        </Box>,
+      )
+    }
     ansiText = ''
+    textParts = []
   }
 
   for (const token of tokens) {
@@ -122,6 +148,12 @@ function renderTokensToNodes(
       )
     } else {
       ansiText += formatToken(token, 0, null, null, highlight)
+      // A top-level token boundary keeps inline formatting and code fences
+      // intact while letting the painter cull finished offscreen text blocks.
+      if (ansiText.length >= TEXT_BLOCK_BUDGET && ansiText.endsWith('\n')) {
+        textParts.push(ansiText)
+        ansiText = ''
+      }
     }
   }
 
@@ -132,8 +164,15 @@ function renderTokensToNodes(
 /**
  * 混合渲染 Markdown 内容：表格用带边框的 flexbox 组件，其余内容由
  * formatToken 生成 ANSI 字符串放入 Text。高亮对象异步就绪后自动刷新。
+ *
+ * memo by content: finished transcript blocks render with the SAME string
+ * identity for the whole session (StreamingMarkdown keeps its stable prefix
+ * identity-stable precisely to hit this); without the memo every parent
+ * re-render re-ran the full token→ANSI→yoga pipeline for every settled
+ * block — the dominant long-output stall (string-width via wrap-ansi, 60%+
+ * of CPU in streaming profiles).
  */
-export function Markdown({ children, dimColor = false, cacheTokens = true }: Props): React.ReactNode {
+function MarkdownImpl({ children, dimColor = false, cacheTokens = true }: Props): React.ReactNode {
   const [highlight, setHighlight] = React.useState<CliHighlight | null>(null)
 
   React.useEffect(() => {
@@ -163,3 +202,15 @@ export function Markdown({ children, dimColor = false, cacheTokens = true }: Pro
     </Box>
   )
 }
+
+/**
+ * Memoized Markdown: skips the whole token→ANSI→layout pipeline when the
+ * content string is the same reference (see MarkdownImpl's doc comment).
+ */
+export const Markdown = React.memo(
+  MarkdownImpl,
+  (prev, next) =>
+    prev.children === next.children &&
+    prev.dimColor === next.dimColor &&
+    prev.cacheTokens === next.cacheTokens,
+)

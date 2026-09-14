@@ -1,5 +1,6 @@
 import React from 'react'
 import Box from '../ink/components/Box.js'
+import type { ClickEvent } from '../ink/events/click-event.js'
 import { ListItem } from './design-system/ListItem.js'
 
 export type SelectOption = {
@@ -10,7 +11,7 @@ export type SelectOption = {
 }
 
 /**
- * A single-choice select list in the CC CustomSelect style (ported visual:
+ * A single-choice select list with the standard dsh-TUI visual treatment:
  * ListItem rows with ❯ focus pointer, ✓ selected checkmark, descriptions,
  * scroll arrows). Keyboard navigation is owned by the parent dialog, which
  * passes focus/selection indices back in.
@@ -20,6 +21,7 @@ export function Select({
   focusIndex,
   selectedValue,
   visibleOptionCount = 5,
+  onPick,
 }: {
   options: readonly SelectOption[]
   /** Index of the keyboard-focused row (shows the ❯ pointer). */
@@ -27,8 +29,14 @@ export function Select({
   /** Value of the chosen row (shows the ✓ checkmark). */
   selectedValue: string | undefined
   visibleOptionCount?: number
+  /**
+   * Mouse pick handler (fullscreen). Clicking a row reports the row's
+   * absolute index — the parent typically applies it with the same code
+   * path as the keyboard Enter. Absent → rows are not clickable.
+   */
+  onPick?: (index: number, value: string, event: ClickEvent) => void
 }): React.ReactNode {
-  // Window around the focus row, with scroll hints at the edges (CC style).
+  // Window around the focus row, with scroll hints at the edges.
   const startIndex = Math.max(
     0,
     Math.min(
@@ -52,6 +60,11 @@ export function Select({
             showScrollUp={absoluteIndex === startIndex && startIndex > 0}
             showScrollDown={
               absoluteIndex === endIndex - 1 && endIndex < options.length
+            }
+            onClick={
+              onPick
+                ? (event) => onPick(absoluteIndex, option.value, event)
+                : undefined
             }
           >
             {option.label}

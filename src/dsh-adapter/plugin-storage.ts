@@ -33,7 +33,8 @@
  * - privacyClass: sensitive — keys AND values are never logged.
  */
 
-import { mkdirSync, readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, rmdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomic, withFileLock } from '@deepseek-ai/dsh-atomic-write'
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -44,11 +45,19 @@ import {
   validateGetOutput,
   validateSetOutput,
   validateDeleteOutput,
-} from '@dsh-std/storage'
+} from '../adapter/standard/protocols.js'
 import { DATA_DIR } from '../utils/paths.js'
-import { declaresPermission, requireComponentIdentity, type VerifiedComponentIdentity } from './component-identity.js'
-import { readGrantStore, type GrantStore } from './grants.js'
+import {
+  assertCapabilityShadowPolicy,
+  type AdapterRuntimeOptions,
+} from '../adapter/kernel/runtime.js'
+import { adapterRuntimeFor } from '../adapter/kernel/runtime-context.js'
+import { activationContext, assertCallerContext, bindCallerEffect, compositionRoot, concreteService } from './host-access.js'
+import { registerStorageLiveProbe } from '../adapter/kernel/host-probe-access.js'
+import { declaresPermission, requireComponentIdentity, requiresContract, type VerifiedComponentIdentity } from './component-identity.js'
+import { readGrantStore, type GrantStore } from '../adapter/standard/grants.js'
 import type { TuiEffectLedgerRuntime } from './effect-ledger.js'
+import { getHostGrantStore } from './host-grants.js'
 
 /** Quota: max distinct keys per namespace. */
 export const STORAGE_MAX_KEYS = 256
@@ -72,6 +81,24 @@ export class PluginStorageError extends Error {
     this.name = 'PluginStorageError'
     this.code = code
   }
+}
+
+interface StorageState {
+  readonly hostContext: Context
+  readonly grantsOption: GrantStore | undefined
+  readonly fallbackGrants: GrantStore
+  readonly ledgerOption: TuiEffectLedgerRuntime | undefined
+  readonly runtime: AdapterRuntimeOptions
+  readonly namespaces: Map<string, NamespaceState>
+  readonly dir: string
+}
+
+const storageStates = new WeakMap<TuiPluginStorageRuntime, StorageState>()
+
+function storageStateFor(runtime: TuiPluginStorageRuntime): StorageState {
+  const state = storageStates.get(concreteService(runtime))
+  if (state === undefined) throw new Error('tuiPluginStorage host state is unavailable')
+  return state
 }
 
 /** The per-namespace handle returned by {@link TuiPluginStorageRuntime.open}. */
@@ -232,18 +259,22 @@ interface NamespaceState {
  * (normal path) or a private read otherwise (bare mounts in tests).
  */
 export class TuiPluginStorageRuntime extends Service {
-  private readonly grantsOption: GrantStore | undefined
-  private readonly fallbackGrants: GrantStore
-  private readonly ledgerOption: TuiEffectLedgerRuntime | undefined
-  private readonly namespaces = new Map<string, NamespaceState>()
-  private readonly dir: string
-
   constructor(ctx: Context, options: { dir?: string; grants?: GrantStore; ledger?: TuiEffectLedgerRuntime } = {}) {
     super(ctx, 'tuiPluginStorage')
-    this.grantsOption = options.grants
-    this.fallbackGrants = readGrantStore()
-    this.ledgerOption = options.ledger
-    this.dir = options.dir ?? join(DATA_DIR, PLUGIN_STORAGE_DIR)
+    storageStates.set(this, {
+hostContext: compositionRoot(ctx),
+      grantsOption: options.grants,
+      fallbackGrants: readGrantStore(undefined, undefined, adapterRuntimeFor(ctx)),
+      ledgerOption: options.ledger,
+      runtime: adapterRuntimeFor(ctx),
+      namespaces: new Map(),
+      dir: options.dir ?? join(DATA_DIR, PLUGIN_STORAGE_DIR),
+    })
+    // Host-only live probe runner. The method is a private ECMAScript member;
+    // plugin-visible Cordis proxies and public types never see a
+    // `probeReversible` entry. Only the internal host-probe accessor (with the
+    // host token) can invoke it.
+    registerStorageLiveProbe(this, () => this.#runReversibleProbe())
   }
 
   /** Grants: the plugin-host row's store when mounted, else a private read.
@@ -251,12 +282,110 @@ export class TuiPluginStorageRuntime extends Service {
    *  are not visible to constructors (cordis), so a constructor-time probe
    *  would silently stick to the fallback. */
   private grants(): GrantStore {
-    return this.grantsOption ?? this.ctx.get('tuiPluginHost')?.grants ?? this.fallbackGrants
+    const state = storageStateFor(this)
+    return state.grantsOption ?? getHostGrantStore(state.hostContext.get('tuiPluginHost')) ?? state.fallbackGrants
   }
 
   /** Optional observability; a bare mount (tests) simply records nothing. */
   private ledger(): TuiEffectLedgerRuntime | undefined {
-    return this.ledgerOption ?? this.ctx.get('tuiEffectLedger')
+    const state = storageStateFor(this)
+    return state.ledgerOption ?? state.hostContext.get('tuiEffectLedger')
+  }
+
+  /**
+   * Host-internal read-only diagnostic probe. Never opens a namespace, never
+   * writes to disk; it only confirms the mounted storage runtime is reachable.
+   */
+  probeDiagnostic(): { service: 'tuiPluginStorage'; ok: true; dir: string } {
+    assertCapabilityShadowPolicy('host.storage.probe', storageStateFor(this).runtime.mode, storageStateFor(this).runtime.slices)
+    const state = storageStateFor(this)
+    return Object.freeze({
+      service: 'tuiPluginStorage',
+      ok: true,
+      dir: state.dir,
+    })
+  }
+
+  /**
+   * Host-internal reversible live probe.
+   *
+   * This runs through the same production storage handle path as plugin
+   * storage (`#openInternal`), using a random temporary namespace. It writes a
+   * tiny JSON document, reads it back, deletes it, and guarantees the file is
+   * removed in a `finally`. The probe deliberately bypasses only the
+   * caller-facing grant/lifecycle bookkeeping; key validation, exact-JSON
+   * validation, quota checks and namespace I/O are the production code.
+   *
+   * Side-effect boundary: the probe file and in-process namespace entry are
+   * removed before this method returns; the storage directory itself is
+   * retained. In passive/replay shadow the capability guard denies this before
+   * any file operation.
+   *
+   * This is an ECMAScript private method. It is reachable only through the
+   * host-only probe accessor registered in the constructor.
+   */
+  async #runReversibleProbe(): Promise<{
+    service: 'tuiPluginStorage'
+    ok: true
+    operations: readonly string[]
+    tempNamespace: string
+  }> {
+    assertCapabilityShadowPolicy('host.storage.liveProbe', storageStateFor(this).runtime.mode, storageStateFor(this).runtime.slices)
+    const state = storageStateFor(this)
+    const tempNamespace = `__dsh_tui_live_probe_${randomUUID().replace(/-/g, '')}`
+    const file = join(state.dir, `${storageFileName(tempNamespace)}.json`)
+    const operations: string[] = []
+    const identity: VerifiedComponentIdentity = {
+      componentId: tempNamespace,
+      activationId: tempNamespace,
+      version: '0.0.0',
+      facet: 'host',
+      manifest: { id: tempNamespace } as never,
+      projection: { id: tempNamespace } as never,
+    }
+    const handle = concreteService(this).#openInternal(state.hostContext, identity, tempNamespace, {
+      enforceGrants: false,
+      bindLifecycle: false,
+      recordLedger: false,
+    })
+    const dirExisted = existsSync(state.dir)
+    try {
+      await handle.set({ key: 'probe', value: { ok: true } })
+      operations.push('write')
+      const read = await handle.get({ key: 'probe' })
+      const parsed = read.value as { ok?: unknown } | null
+      if (parsed?.ok !== true) throw new Error('temporary storage probe document did not round-trip through the production handle')
+      operations.push('read')
+      const deleted = await handle.delete({ key: 'probe' })
+      if (!deleted.deleted) throw new Error('temporary storage probe key was not deleted through the production handle')
+      operations.push('delete')
+      return Object.freeze({
+        service: 'tuiPluginStorage',
+        ok: true,
+        operations: Object.freeze(operations),
+        tempNamespace,
+      })
+    } catch (error) {
+      throw new PluginStorageError(
+        'STORAGE_UNAVAILABLE',
+        `storage reversible probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    } finally {
+      state.namespaces.delete(tempNamespace)
+      try {
+        unlinkSync(file)
+      } catch {
+        // Cleanup is best-effort; the file is namespaced by a fresh UUID and
+        // cannot be confused with a real plugin namespace.
+      }
+      if (!dirExisted) {
+        try {
+          if (existsSync(state.dir)) rmdirSync(state.dir)
+        } catch {
+          // The probe must not remove a non-empty pre-existing user directory.
+        }
+      }
+    }
   }
 
   /**
@@ -266,35 +395,77 @@ export class TuiPluginStorageRuntime extends Service {
    * disposer); data is retained (contract cleanup rule).
    */
   open(pluginCtx: Context): TuiPluginStorage {
-    const identity = requireComponentIdentity(pluginCtx)
-    const plugin = identity.componentId
-    let state = this.namespaces.get(plugin)
-    if (state === undefined) {
-      state = { chain: Promise.resolve() }
-      this.namespaces.set(plugin, state)
+    assertCapabilityShadowPolicy('host.storage.open', storageStateFor(this).runtime.mode, storageStateFor(this).runtime.slices)
+    const caller = activationContext(pluginCtx)
+    if (caller === undefined) throw new PluginStorageError('STORAGE_UNAVAILABLE', 'storage.local.open requires a live activation context')
+    assertCallerContext(this.ctx, caller, 'storage.local.open', this)
+    const state = storageStateFor(this)
+    const identity = requireComponentIdentity(caller)
+    if (!requiresContract(identity, 'storage.dsh/v1alpha1', 'LocalStorage')) {
+      throw new PluginStorageError(
+        'PERMISSION_NOT_GRANTED',
+        'storage.local requires the storage.dsh/v1alpha1#LocalStorage contract in the admitted manifest',
+      )
     }
-    this.ledger()?.record(
-      { operation: 'create', resource: { kind: 'storage-namespace', id: plugin }, result: 'applied' },
-      pluginCtx,
-    )
+    // Cordis hands the service out through a Proxy, so `this` is not branded:
+    // unwrap to the concrete instance before calling the `#private` member
+    // (same pattern as message-observer's `#registerSubscription`).
+    return concreteService(this).#openInternal(caller, identity, identity.componentId, {
+      enforceGrants: true,
+      bindLifecycle: true,
+      recordLedger: true,
+    })
+  }
+
+  /**
+   * Internal production storage-path implementation shared by the public
+   * `open()` surface and the reversible live probe. The probe passes a
+   * synthetic temporary identity and disables only the caller-facing
+   * authorization/lifecycle bookkeeping; all key validation, exact-JSON
+   * validation, namespace file handling, quota checks and read/write/delete
+   * operations are exactly the production handle code.
+   *
+   * A true `#private` member, not TS `private`: the latter still compiles to a
+   * prototype method, so a plugin holding `ctx.tuiPluginStorage` could call it
+   * through `as any` with `enforceGrants: false` and a forged namespace and
+   * read another component's storage with no grant, ledger entry or unload
+   * cleanup. Only the two in-class call sites above may reach it.
+   */
+  #openInternal(
+    caller: Context,
+    identity: VerifiedComponentIdentity,
+    plugin: string,
+    options: { readonly enforceGrants: boolean; readonly bindLifecycle: boolean; readonly recordLedger: boolean },
+  ): TuiPluginStorage {
+    const state = storageStateFor(this)
+    const runtime = state.runtime
+    let namespace = state.namespaces.get(plugin)
+    if (namespace === undefined) {
+      namespace = { chain: Promise.resolve() }
+      state.namespaces.set(plugin, namespace)
+    }
+    if (options.recordLedger) {
+      this.ledger()?.record(
+        { operation: 'create', resource: { kind: 'storage-namespace', id: plugin }, result: 'applied' },
+        caller,
+      )
+    }
     // `closed` is PER HANDLE, not per namespace: unloading one fiber must not
     // kill another handle opened on the same namespace. Close on unload;
-    // idempotent (a double-close stays harmless by design); degraded contexts
-    // without `effect` simply never auto-close.
+    // idempotent (a double-close stays harmless by design).
     let closed = false
-    try {
-      pluginCtx.effect(() => () => {
-        if (closed) return
-        closed = true
+    const close = (): void => {
+      if (closed) return
+      closed = true
+      if (options.recordLedger) {
         this.ledger()?.record(
           { operation: 'release', resource: { kind: 'storage-namespace', id: plugin }, result: 'applied' },
-          pluginCtx,
+          caller,
         )
-      })
-    } catch {
-      // Degraded context: the handle lives until process end.
+      }
     }
-    const file = join(this.dir, `${storageFileName(plugin)}.json`)
+    if (options.bindLifecycle) bindCallerEffect(caller, close)
+    const file = join(state.dir, `${storageFileName(plugin)}.json`)
     const grants = (): GrantStore => this.grants()
     const ledger = (): TuiEffectLedgerRuntime | undefined => this.ledger()
 
@@ -302,9 +473,9 @@ export class TuiPluginStorageRuntime extends Service {
       if (closed) {
         return Promise.reject(new PluginStorageError('STORAGE_UNAVAILABLE', `storage namespace "${plugin}" handle is closed`))
       }
-      const run = state.chain.then(operation)
+      const run = namespace!.chain.then(operation)
       // Keep the chain alive after a failure without unhandled rejections.
-      state.chain = run.catch(() => {})
+      namespace!.chain = run.catch(() => {})
       return run
     }
 
@@ -344,12 +515,13 @@ export class TuiPluginStorageRuntime extends Service {
     }
 
     const requireGrant = (permission: 'storage.local.read' | 'storage.local.write') => {
-      if (!declaresPermission(identity, permission, plugin)
-        || !grants().allows(
-          { componentId: identity.componentId, activationId: identity.activationId },
-          permission,
-          plugin,
-        )) {
+      if (options.enforceGrants
+        && (!declaresPermission(identity, permission, plugin)
+          || !grants().allows(
+            { componentId: identity.componentId, activationId: identity.activationId },
+            permission,
+            plugin,
+          ))) {
         ledger()?.record(
           {
             operation: 'bind',
@@ -357,7 +529,7 @@ export class TuiPluginStorageRuntime extends Service {
             result: 'failed',
             errorCode: 'PERMISSION_NOT_GRANTED',
           },
-          pluginCtx,
+          caller,
         )
         throw new PluginStorageError(
           'PERMISSION_NOT_GRANTED',
@@ -372,11 +544,12 @@ export class TuiPluginStorageRuntime extends Service {
     // path (read paths tolerate ENOENT as an empty namespace and never
     // materialize the tree).
     const ensureDir = (): void => {
-      mkdirSync(this.dir, { recursive: true, mode: 0o700 })
+      mkdirSync(state.dir, { recursive: true, mode: 0o700 })
     }
 
     return {
       get: (input: { key: string }) => enqueue(async () => {
+        assertCapabilityShadowPolicy('host.storage.read', runtime.mode, runtime.slices)
         validateStorageInput('get', input)
         const key = input.key
         assertKey(key)
@@ -389,6 +562,7 @@ export class TuiPluginStorageRuntime extends Service {
         return output
       }),
       set: (input: { key: string; value: unknown }) => enqueue(async () => {
+        assertCapabilityShadowPolicy('host.storage.write', runtime.mode, runtime.slices)
         validateStorageInput('set', input)
         const key = input.key
         const value = input.value
@@ -415,6 +589,7 @@ export class TuiPluginStorageRuntime extends Service {
         })
       }),
       delete: (input: { key: string }) => enqueue(async () => {
+        assertCapabilityShadowPolicy('host.storage.write', runtime.mode, runtime.slices)
         validateStorageInput('delete', input)
         const key = input.key
         assertKey(key)

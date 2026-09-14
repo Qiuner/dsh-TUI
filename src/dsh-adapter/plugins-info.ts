@@ -25,17 +25,15 @@
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { parseManifest, projectManifest } from '@dsh-std/manifest'
+import { parseManifest, projectManifest } from '../adapter/standard/protocols.js'
 import { DATA_DIR } from '../utils/paths.js'
 import { t } from '../i18n.js'
-import { loadSpecData } from '../plugin-spec/registry.js'
-import { createContractIndex, validatePlugin } from '../plugin-spec/validate.js'
-import { negotiate } from '../plugin-spec/negotiate.js'
-import type { NegotiationDecision } from '../plugin-spec/types.js'
+import { loadSpecData } from '../adapter/standard/registry.js'
+import { createContractIndex, validatePlugin, negotiate } from '../adapter/standard/admission.js'
+import type { NegotiationDecision } from '../adapter/standard/types.js'
 import { cleanScalarText } from './sanitize.js'
-import type { GrantStore } from './grants.js'
-import type { HostDescriptorBuild } from './host-descriptor.js'
-import { buildHostDescriptor } from './host-descriptor.js'
+import type { GrantStore } from '../adapter/standard/grants.js'
+import type { HostDescriptorBuild } from '../adapter/standard/descriptor.js'
 import { PLUGIN_STORAGE_DIR } from './plugin-storage.js'
 import { EFFECT_LEDGER_FILE } from './effect-ledger.js'
 
@@ -167,7 +165,14 @@ function checkManifestLines(pathArg: string, deps: PluginsInfoDeps): string[] {
     lines.push(t('plugins-check-invalid', { err: cell(error instanceof Error ? error.message : String(error)) }))
     return lines
   }
-  const host = deps.host ?? buildHostDescriptor({ generationId: 'plugins-check' })
+  // No live host: do NOT fall back to a full advertised surface. The check
+  // stays static (validation only) and explicitly reports host-unavailable /
+  // non-live instead of participating in protocol support negotiation.
+  const host = deps.host
+  if (host === undefined) {
+    lines.push(t('plugins-check-host-unavailable'))
+    return lines
+  }
   const granted = manifest.permissions
     .map(request => ({
       name: request.name,
@@ -179,6 +184,15 @@ function checkManifestLines(pathArg: string, deps: PluginsInfoDeps): string[] {
     }))
   const decision = negotiate(index, manifest, host.descriptor, granted)
   lines.push(...decisionLines(decision))
+  if (decision.decision === 'waiting_authorization') {
+    // Close the loop on the five-state vocabulary: the user sees not just
+    // the state but the exact file + shape that flips it (the interactive
+    // grant flow is future work; this hint is its no-UI prerequisite).
+    lines.push(t('plugins-check-grant-hint', {
+      id: cell(manifest.id),
+      perms: cell(decision.deniedPermissions.join(', ')),
+    }))
+  }
   if (host.dropped.length > 0) {
     lines.push(t('plugins-check-dropped', { dropped: cell(host.dropped.join(', ')) }))
   }
@@ -277,6 +291,9 @@ export function pluginsInfoLines(args: string, deps: PluginsInfoDeps): string[] 
     if (plugins.length > shown.length) {
       lines.push(`  ${t('plugins-footprint-overflow', { count: plugins.length - shown.length })}`)
     }
+    // Actionable next step for the · marks (same loop-closer as the check
+    // path): the file path + rule shape, so granting needs no spec reading.
+    lines.push(`  ${t('plugins-grant-hint')}`)
   }
 
   // ── 台账尾 ──

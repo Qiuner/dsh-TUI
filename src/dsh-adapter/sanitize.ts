@@ -19,8 +19,13 @@ import { stringWidth } from '../ink/stringWidth.js'
 
 /** Sanitize an already-string value for the render path. */
 export function cleanRenderText(value: string, maxCells: number): string {
+  // Remove complete ANSI control sequences before stripping control bytes.
+  // Otherwise an SGR such as ESC[31m becomes the visible garbage "[31m".
+  const withoutAnsi = value
+    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, '')
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, '')
   // eslint-disable-next-line no-control-regex -- deliberate: sanitize untrusted render-path text
-  const flat = value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim()
+  const flat = withoutAnsi.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim()
   if (stringWidth(flat) <= maxCells) return flat
   let out = ''
   for (const ch of flat) {
@@ -62,4 +67,19 @@ export function capCells(value: string, maxCells: number): string {
 export function flattenInline(value: string): string {
   // eslint-disable-next-line no-control-regex -- deliberate: sanitize untrusted render-path text
   return value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')
+}
+
+/**
+ * Single-line field ingress for terminal/clipboard paste: strip COMPLETE
+ * ANSI/OSC sequences first (paste content is user-controlled bytes — a
+ * smuggled ESC[… would otherwise break out of the render path), then flatten
+ * every remaining C0/C1 control char to a space. Unlike {@link flattenInline},
+ * this never leaves `[31m`-style residue behind; the two regexes mirror
+ * {@link cleanRenderText}'s strip, and the final pass covers the rest.
+ */
+export function flattenPasteInline(value: string): string {
+  const withoutAnsi = value
+    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, '')
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, '')
+  return flattenInline(withoutAnsi)
 }

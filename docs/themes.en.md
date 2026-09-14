@@ -9,7 +9,7 @@ dsh-TUI provides three Gentle Mist Blue palettes, plus an `auto` pseudo-theme:
 | Name | Purpose |
 | --- | --- |
 | `auto` | Pseudo-theme: follows the system/terminal background, resolving to `light` or `dark` |
-| `light` | Warm-white surfaces, ink body text, and mist-blue interaction color |
+| `light` | White panels, ink body text, and mist-blue interaction color |
 | `dark` | Dark-terminal adaptation with warm-gray text and soft blue accents |
 | `dark-ansi` | Compatibility fallback using only the 16 ANSI colors |
 
@@ -17,8 +17,12 @@ Without an explicit choice, the TUI queries the terminal background with OSC
 11 and selects `light` or `dark`. It falls back to `dark` when the terminal does
 not answer.
 
+Light-theme panels, tool cards, and image previews use white (`#FFFFFF`) surfaces by
+default; image previews use neutral borders. Dark palettes and accent colors are
+unchanged. This does not modify the terminal's own background or wallpaper.
+
 `auto` turns that one-shot startup detection into a standing choice: it is a
-valid value for `/theme`, `CC_TUI_THEME`, and `~/.dsh-cc/theme.json`. Selecting
+valid value for `/theme`, `DSH_TUI_THEME`, and `~/.dsh-tui/theme.json`. Selecting
 `auto` applies the last detected base immediately and re-queries OSC 11 in the
 background — on terminals that follow the system theme, picking `auto` again
 (or restarting) catches up after a system light/dark switch. `/theme status`
@@ -37,8 +41,8 @@ DSH_TUI_THEME
 
 ## Switching themes
 
-- `/theme` opens the picker, with `auto` and the built-ins before custom themes.
-- `/theme <name>` switches directly.
+- `/theme` opens the picker, with `auto` and the built-ins before static JSON and plugin themes.
+- `/theme <name>` switches directly to a static or runtime plugin theme.
 - `/theme status` shows the current theme and persistence location.
 
 Confirming a choice hot-switches immediately and writes it to
@@ -55,8 +59,12 @@ palette and overrides a subset of its colors:
   "displayName": "Sakura",
   "base": "dark",
   "colors": {
-    "claude": "#FF9EC7",
-    "claudeShimmer": "#FFC0D5",
+    "accent": "#FF9EC7",
+    "accentShimmer": "#FFC0D5",
+    "activity": "#7DA1DE",
+    "activityShimmer": "#ABC2EC",
+    "mascotBody": "#D98A63",
+    "inputBackground": "#000000",
     "permission": "#FFB3CC",
     "promptBorder": "#B08B99",
     "text": "#E8E6E0",
@@ -82,6 +90,36 @@ Fields:
 When the file declares `name`, its filename remains a loading alias. See the
 `Theme` type in [`src/theme.ts`](../src/theme.ts) for every semantic key.
 
+## npm plugin themes
+
+An npm plugin can register a runtime theme through the `dsh-tui-extensions` row
+without writing to `~/.dsh-tui/themes/`:
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+import type { TuiThemeDescriptor } from '@deepseek-harness-tui/dsh-tui/extensions'
+
+export function apply(ctx: Context): void {
+  const themes = ctx.get('tuiThemes', false)
+  themes?.register({
+    name: 'my-plugin:night',
+    displayName: 'Night',
+    base: 'dark',
+    colors: { accent: '#88AAFF', selectionBg: '#334466' },
+  }, ctx)
+}
+```
+
+Use a lowercase safe ID such as `plugin-id:theme-id`. `base` remains `light`,
+`dark`, or `dark-ansi`, and `colors` is a partial override of the `Theme`
+semantic keys. `auto`, built-ins, and `status` are reserved. Registrations are
+removed with the plugin activation, and the returned disposer can remove one
+early. Plugin themes appear in the `/theme` picker, completion, and direct
+switching; their names use the existing `~/.dsh-tui/theme.json` persistence.
+Built-ins win over static JSON, and static JSON wins over a same-name plugin
+theme. On an older profile without `tuiThemes`, the plugin degrades silently
+and static themes remain unaffected.
+
 Common override groups:
 
 | Group | Keys |
@@ -93,6 +131,17 @@ Common override groups:
 
 Diff semantics outrank syntax colors: changed words always render in
 `diffAddedWord` / `diffRemovedWord`; syntax colors apply to unchanged text only.
+
+`accent`, `accentShimmer`, `activity`, `activityShimmer`, `mascotBody`, and
+`inputBackground` are the current semantic keys. Older theme files and plugin
+descriptors using `claude`, `claudeShimmer`,
+`claudeBlue_FOR_SYSTEM_SPINNER`, `claudeBlueShimmer_FOR_SYSTEM_SPINNER`,
+`clawd_body`, or `clawd_background` are still accepted and mapped to the
+corresponding semantic key. Resolved themes expose semantic keys only; new
+themes should use the current names.
+
+The former `briefLabelYou` key maps to `userPromptLabel`. Unused palette slots
+from older releases are ignored; the remaining valid color overrides still apply.
 
 ## Color formats
 

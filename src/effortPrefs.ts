@@ -1,10 +1,11 @@
 /**
- * Persisted reasoning-effort preference (`~/.dsh-tui/effort.json`). Shift+Tab
- * cycles the live route's adapter-owned levels (dsh-llm `LlmModelReasoningInfo`);
- * the choice lands here so the next boot starts on it. The file is
- * best-effort: a missing/corrupt file or a level the current adapter does not
- * offer just falls back to the provider default — the first request/header
- * event always re-asserts the truth on the status line.
+ * Persisted reasoning-effort preference (`~/.dsh-tui/effort.json`). Set via
+ * `/effort` (slider or `/effort <id>`; `/effort status` reports the current
+ * level) — note Shift+Tab cycles session modes (default/plan/full), not
+ * effort levels. The choice lands here so the next boot starts on it. The
+ * file is best-effort: a missing/corrupt file or a level the current adapter
+ * does not offer just falls back to the provider default — the first
+ * request/header event always re-asserts the truth on the status line.
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -27,6 +28,26 @@ export function readEffortPref(dir: string = PREFS_DIR): string | undefined {
   } catch {
     return undefined
   }
+}
+
+/**
+ * Default reasoning-effort precedence for sessions that do not carry their
+ * own choice: the /settings 默认推理强度 user layer (`settings.yaml
+ * dsh-tui.effortDefault`; the plugin folds the `auto` option to undefined
+ * before calling), then the cordis.yml `effort` pin, then this persisted
+ * `/effort` file, then the adapter/model default (undefined). Mirrors the
+ * lang chain (settings user layer > cordis.yml > lang.json).
+ * @param settingsDefault - settings user-layer level (undefined = auto).
+ * @param configured - cordis.yml `effort` value, if any.
+ * @param persisted - The /effort choice, if any.
+ * @returns The winning level id, or undefined for the adapter default.
+ */
+export function resolveEffortDefault(
+  settingsDefault: string | undefined,
+  configured: string | undefined,
+  persisted: string | undefined,
+): string | undefined {
+  return settingsDefault ?? configured ?? persisted
 }
 
 /**

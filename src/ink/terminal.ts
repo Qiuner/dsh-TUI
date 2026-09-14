@@ -10,7 +10,6 @@ import {
   cursorMove,
   cursorTo,
   ERASE_SCREEN,
-  ERASE_SCROLLBACK,
   eraseLines,
   SGR_RESET,
 } from './termio/csi.js'
@@ -159,7 +158,7 @@ export function isSynchronizedOutputSupported(): boolean {
 // -- XTVERSION-detected terminal name (populated async at startup) --
 //
 // TERM_PROGRAM is not forwarded over SSH by default, so env-based detection
-// fails when claude runs remotely inside a VS Code integrated terminal.
+// fails when dsh-tui runs remotely inside a VS Code integrated terminal.
 // XTVERSION (CSI > 0 q → DCS > | name ST) goes through the pty — the query
 // reaches the *client* terminal and the reply comes back through stdin.
 // App.tsx fires the query when raw mode enables; setXtversionName() is called
@@ -188,6 +187,34 @@ export function setXtversionName(name: string): void {
 export function isXtermJs(): boolean {
   if (process.env.TERM_PROGRAM === 'vscode') return true
   return xtversionName?.startsWith('xterm.js') ?? false
+}
+
+/**
+ * True when the terminal can be safely probed with DECRQM
+ * (`CSI ? <mode> $ p`).
+ *
+ * DECRQM carries a `$` intermediate byte before its final `p`. A conforming
+ * parser consumes the whole sequence and either answers with DECRPM or stays
+ * silent, so callers have historically treated an unanswered probe as
+ * "unsupported" and sent it unconditionally. macOS Terminal.app breaks that
+ * assumption: it does not implement DECRQM *and* its CSI parser gives up at
+ * the `$`, printing the trailing `p` to the screen as literal text. Every
+ * probe therefore leaks a visible `p` at the cursor.
+ *
+ * Terminal.app reports `TERM=xterm-256color`, so TERM sniffing cannot tell it
+ * apart from a real xterm — `TERM_PROGRAM=Apple_Terminal` is the only marker.
+ * It is not forwarded over SSH, which matches the scope of the bug: the leak
+ * only happens when the sequence reaches Terminal.app's own parser, and a
+ * remote session is parsed by whatever terminal is actually attached.
+ *
+ * Kept as an exclusion rather than an allowlist so unknown terminals keep the
+ * (correct, spec-conforming) probe and only the known-broken one opts out.
+ * Same failure mode as the extended-keys allowlist below: assuming terminals
+ * silently ignore unknown CSI is not safe in practice.
+ * @returns true when it is safe to send a DECRQM probe.
+ */
+export function supportsDecrqmProbe(): boolean {
+  return process.env.TERM_PROGRAM !== 'Apple_Terminal'
 }
 
 // Terminals known to correctly implement the Kitty keyboard protocol
@@ -290,8 +317,7 @@ export const SYNC_OUTPUT_SUPPORTED = isSynchronizedOutputSupported()
  * driven per-frame by a diffing renderer, corrupts the screen progressively
  * as content scrolls (the "JetBrains terminal slowly garbles" bug class).
  * The diff engine falls back to repainting the shifted rows cell-by-cell,
- * which every terminal renders identically. Same gate as upstream Claude
- * Code, which hard-disables DECSTBM on JetBrains terminals.
+ * which every terminal renders identically. Disable DECSTBM on JetBrains terminals.
  * @returns true when DECSTBM scroll optimization is safe on this terminal.
  */
 export function isDecstbmSafe(): boolean {
@@ -335,14 +361,22 @@ export type Terminal = {
  * @param diff - the frame diff patches to render.
  * @param skipSyncMarkers - when true, omit the BSU/ESU wrapping.
  */
-export function writeDiffToTerminal(
+/**
+ * Serialize a frame diff into a single ANSI string (BSU/ESU-wrapped unless
+ * skipSyncMarkers is set). Empty string when the diff has no patches.
+ * Extracted from writeDiffToTerminal so shutdown paths can write the last
+ * frame synchronously (issue #522: an async frame write racing the
+ * synchronous EXIT_ALT_SCREEN lands on the MAIN screen after the alt
+ * screen is gone, leaving misplaced residue).
+ */
+export function serializeDiff(
   terminal: Terminal,
   diff: Diff,
   skipSyncMarkers = false,
-): void {
+): string {
   // No output if there are no patches
   if (diff.length === 0) {
-    return
+    return ''
   }
 
   // BSU/ESU wrapping is opt-out to keep main-screen behavior unchanged.
@@ -376,18 +410,26 @@ export function writeDiffToTerminal(
         // Hard clear of screen + scrollback. MUST run OUTSIDE the BSU/ESU
         // sync block: Windows Terminal snaps the viewport back to the top
         // when 2J/3J execute inside a synchronized-update block
-        // (claude-code#35580) — the reason the scrollUp-based "soft" clear
+        // — the reason the scrollUp-based "soft" clear
         // existed at all. Close the block, clear, reopen. Everything stays
         // in the SAME write, so the terminal processes it with no
         // intermediate paint. The hard clear actually removes the UI's
         // scrollback snapshots (the duplicated whale-logo class of bugs);
         // the old soft clear (CSI n S) PUSHED the live viewport into the
         // scrollback instead, depositing a fresh full-UI copy per reset.
+        // Screen-only hard clear: 2J + home, NO 3J. Erasing the scrollback
+        // here destroyed the user's entire visible history on every settle
+        // shrink (the "context lost / cannot scroll" reports) — the inline
+        // transcript IS the scrollback; wiping it to avoid duplicate
+        // snapshots is never an acceptable trade. 2J clears the screen for
+        // the repaint while everything above the viewport survives.
+        // Executed OUTSIDE the DEC 2026 sync block (split begin/end): WT
+        // yanks the viewport to top when 2J runs inside a synchronized
+        // update.
         buffer +=
           (useSync ? ESU : '') +
           SGR_RESET +
           ERASE_SCREEN +
-          ERASE_SCROLLBACK +
           CURSOR_HOME +
           (useSync ? BSU : '')
         break
@@ -418,5 +460,25 @@ export function writeDiffToTerminal(
   // Add synchronized update end and flush buffer
   if (useSync) buffer += ESU
   dumpFrame(buffer)
+  return buffer
+}
+
+/**
+ * Write a frame diff to the terminal as a single buffered write. Wraps
+ * the output in BSU/ESU synchronized-update markers unless skipSyncMarkers
+ * is set. No-op when the diff contains no patches.
+ * @param terminal - the terminal to write to.
+ * @param diff - the frame diff patches to render.
+ * @param skipSyncMarkers - when true, omit the BSU/ESU wrapping.
+ */
+export function writeDiffToTerminal(
+  terminal: Terminal,
+  diff: Diff,
+  skipSyncMarkers = false,
+): void {
+  const buffer = serializeDiff(terminal, diff, skipSyncMarkers)
+  if (buffer === '') {
+    return
+  }
   terminal.stdout.write(buffer)
 }

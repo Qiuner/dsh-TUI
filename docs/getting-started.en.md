@@ -55,38 +55,22 @@ command. It does not copy source files and does not require a local build.
 ## Migrate from the former package
 
 Earlier releases used the unscoped `dsh-cc-tui` package and a `cc-tui`
-profile. The current identity is `@deepseek-harness-tui/dsh-tui` in a
-`dsh-tui` profile. Create the new profile with:
+profile, with `CC_TUI_*`/`DSH_CC_*` environment variables and a `~/.dsh-cc`
+data directory. The current identity is `@deepseek-harness-tui/dsh-tui` in a
+`dsh-tui` profile, using only `DSH_TUI_*` variables and `~/.dsh-tui`. Create
+the new profile with:
 
 ```sh
 dsh plugin --profile dsh-tui add @deepseek-harness-tui/dsh-tui
 dsh --profile dsh-tui
 ```
 
-This release completes the rename of environment variables and the data
-directory: `CC_TUI_*` and `DSH_CC_*` become `DSH_TUI_*` (for example
-`CC_TUI_THEME` → `DSH_TUI_THEME`), and the data directory moves from
-`~/.dsh-cc` to `~/.dsh-tui`. Behavior notes:
-
-- Old variable names no longer take effect. If a legacy name is still set at
-  startup, one warning line is printed asking you to switch to the new name
-  (the warning repeats on every launch while the old name remains set).
-- The only exception is the resume contract: `DSH_TUI_RESUME_SESSION` is the
-  new name, the reader prefers it but still accepts the old
-  `DSH_CC_RESUME_SESSION`, and the writer sets both variables so older
-  launchers keep working during the transition.
-- The data directory migrates automatically: on first launch, if `~/.dsh-cc`
-  exists and `~/.dsh-tui` does not, the old directory is **copied** (not
-  moved) to the new location and one notice line is printed. Themes, model
-  and preset choices, and input history come along. The old directory stays
-  in place; remove it yourself once the new one works.
-- `resume.txt` is an exception: it is written to both the new and the old
-  path, so older launchers that only read the old path still find the recent
-  session.
-
-After the new profile works, `$DSH_HOME/profiles/cc-tui` is only a
-former installation and may be removed when convenient. Do not add both
-packages to the same profile.
+The current release no longer reads the old names and does not migrate data
+automatically. After first launch, copy themes, configuration and history
+files from the old data directory (`~/.dsh-cc`) into `~/.dsh-tui` yourself.
+Once the new profile works, `$DSH_HOME/profiles/cc-tui` and the old data
+directory are just former-installation leftovers and may be removed when
+convenient. Do not add both packages to the same profile.
 
 ## What installation does
 
@@ -130,9 +114,7 @@ dsh-tui.cmd --resume
 ```
 
 `--resume` reads `%USERPROFILE%\.dsh-tui\resume.txt` and restores the session
-last selected by the TUI. The file is also dual-written to the old path
-`%USERPROFILE%\.dsh-cc\resume.txt` so older launchers that only read the old
-path keep working. Set `DSH_TUI_WORKSPACE` to override the working
+last selected by the TUI. Set `DSH_TUI_WORKSPACE` to override the working
 directory used by the batch launcher.
 
 ## Update to the latest version
@@ -175,17 +157,28 @@ the profile.
 ## Develop from source
 
 ```sh
-git clone https://github.com/ccch1mneyyy/dsh-TUI.git
+git clone --recurse-submodules https://github.com/ccch1mneyyy/dsh-TUI.git
 cd dsh-TUI
 pnpm install --frozen-lockfile
 pnpm build
 pnpm smoke
 ```
 
+The repository has three submodules, and two of them are required to install:
+`vendor/dsh-std` (its `packages/*` are listed as workspace packages in
+`pnpm-workspace.yaml`) and `dsh-auth` (pulled in through `link:`). Without
+`--recurse-submodules` those directories stay empty and
+`pnpm install --frozen-lockfile` fails outright. For a checkout that was already
+cloned:
+
+```sh
+git submodule update --init --recursive
+```
+
 `pnpm build` cleans the ignored `lib/` directory, compiles `src/` into
-`lib/types/`, and runs the build gates. npm Git URL installs generate the same
-runtime through `prepare`; the publish workflow also performs an explicit clean
-compilation and package-surface check before packing.
+`lib/types/`, and runs the build gates. **Git URL installs are not supported**
+(workspace deps / submodule / pnpm ≥11 prepare allowlist); the publish workflow
+performs an explicit clean compilation and package-surface check before packing.
 
 For an integration test of the current source, run this once after initial
 setup or whenever the normal model/key configuration changes:
@@ -235,6 +228,13 @@ the same profile installation path as an end-user install.
 
 stdout is not a TTY. Start the process directly in a terminal rather than
 redirecting its main output to another command or file.
+
+When dsh-tui is only installed in a profile and the DSH composition is started
+by a non-terminal host (Web / Tauri / GUI, stdout piped or null), dsh-tui
+detects that stdout is not a TTY and that the process was not started by the
+`dsh-tui` launcher, and silently skips the TUI frontend (no error, the host
+keeps booting). The error above only appears when `dsh-tui` (or the standalone
+portable build) was explicitly launched without a TTY.
 
 ### `dsh` or `pnpm` cannot be found
 
